@@ -6,7 +6,7 @@
 
 **Architecture:** 双进程（Gin API + 采集 worker）共享 MySQL 8 与 Redis 7。采集采用四层管线：`GetPlayerSummaries` 批量探针（100 人/次）驱动一个纯函数会话状态机，状态机产出的事件经 MySQL 本地事务表异步下钻到时长结算与成就同步，每日 `GetOwnedGames` 全量校准兜底。不使用消息队列，异步与补偿全部由本地事务表 + `SELECT ... FOR UPDATE SKIP LOCKED` + 租约超时承担。
 
-**Tech Stack:** Go 1.24、Gin、GORM、MySQL 8、Redis 7、golang-migrate、testify、testcontainers-go
+**Tech Stack:** Go 1.24、Gin、GORM、MySQL 8、Redis 7、spf13/viper、log/slog、testify
 
 **设计依据:** 本计划实现 `docs/01-design.md`。任务中引用设计文档章节号处，实现前应先读该章节。
 
@@ -20,7 +20,10 @@
 - 所有 Steam 时长字段单位为**分钟**；`unlocktime`、`rtime_last_played` 为 Unix 秒级时间戳
 - **只有 `internal/steam` 包可以发起对 Steam 的 HTTP 请求。** 其他包一律通过 `steam.Client` 接口，禁止直接构造 Steam URL
 - `internal/domain` 包**禁止**导入 `gorm.io/*`、`net/http`、`time.Now`。时钟一律作为参数传入
-- 数据库迁移使用 SQL 文件 + golang-migrate，**禁止使用 GORM AutoMigrate**（生成列、复合唯一键、`DECIMAL` 精度等 AutoMigrate 处理不正确）
+- 表结构由 `scripts/db/init.sql` 定义，**禁止使用 GORM AutoMigrate**（生成列、复合唯一键、`DECIMAL` 精度等 AutoMigrate 处理不正确）。后续变更放入 `scripts/db/migrations/`，按 `NNN_描述.sql` 命名，不修改 `init.sql`
+- 配置放 `configs/*.yaml`，用 `spf13/viper` 加载。**敏感项（`steam.api_key`、`mysql.password`、`auth.state_secret`）在 YAML 中必须留空**，仅由 `STEAMLINK_*` 环境变量注入 —— `configs/` 会进仓库
+- 日志一律使用标准库 `log/slog`。**禁止 `fmt.Printf`、`log.Printf`、`log.Fatalf`**，也禁止依赖 `slog.Default()`；`*slog.Logger` 通过依赖注入传递
+- 日志中的 SteamID 用 `slog.String("steam_id", strconv.FormatUint(id, 10))` 输出，理由同上（日志采集链路多经 JSON，数字会丢精度）
 - 每个任务结束时必须 `go vet ./...` 与 `go test ./...` 全绿才能提交
 
 ---
@@ -31,11 +34,20 @@
 go.mod                                  module steamlink
 cmd/api/main.go                         Gin HTTP 服务入口
 cmd/worker/main.go                      采集 worker 入口
-migrations/
-  000001_init.up.sql                    全部建表 DDL
-  000001_init.down.sql                  回滚
+configs/
+  config.yaml                           基础配置，所有环境共享
+  config.dev.yaml                       开发环境覆盖项
+  config.prod.yaml                      生产环境覆盖项
+scripts/
+  db/
+    init.sql                            全部建表 DDL
+    migrations/                         后续增量变更（初期为空）
+  dev/
+    up.sh                               起本地依赖并初始化数据库
+    test.sh                             跑全量测试
 internal/
-  config/config.go                      环境变量配置加载
+  config/config.go                      viper 加载、合并与校验
+  logging/logging.go                    slog Logger 构造
   store/
     db.go                               GORM 连接构造
     redis.go                            Redis 客户端构造
@@ -77,22 +89,28 @@ internal/
 
 ---
 
-## Task 1: 项目骨架与数据库迁移
+## Task 1: 项目骨架、配置、日志与数据库初始化
 
 **Files:**
-- Create: `go.mod`, `internal/config/config.go`, `internal/store/db.go`, `internal/store/redis.go`
-- Create: `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`
-- Create: `docker-compose.yml`
-- Test: `internal/config/config_test.go`, `internal/store/db_test.go`
+- Create: `go.mod`, `docker-compose.yml`
+- Create: `configs/config.yaml`, `configs/config.dev.yaml`, `configs/config.prod.yaml`
+- Create: `internal/config/config.go`, `internal/logging/logging.go`
+- Create: `internal/store/db.go`, `internal/store/redis.go`
+- Create: `scripts/db/init.sql`, `scripts/dev/up.sh`, `scripts/dev/test.sh`
+- Test: `internal/config/config_test.go`, `internal/logging/logging_test.go`
 
 **Interfaces:**
 - Consumes: 无（首个任务）
 - Produces:
-  - `config.Config` 结构体，字段：`MySQLDSN string`、`RedisAddr string`、`RedisPassword string`、`SteamAPIKey string`、`BaseURL string`、`HTTPAddr string`
-  - `config.Load() (Config, error)` — 从环境变量加载，缺失必填项返回错误
-  - `store.NewDB(dsn string) (*gorm.DB, error)`
-  - `store.NewRedis(addr, password string) (*redis.Client, error)`
-  - 迁移文件中的全部表结构（后续所有任务的 GORM 模型必须与之一致）
+  - `config.Config` 及其子结构：`AppConfig{Env string}`、`HTTPConfig{Addr, BaseURL string}`、`MySQLConfig{Host string, Port int, User, Password, Database string}`、`RedisConfig{Addr, Password string, DB int}`、`SteamConfig{APIKey string, RatePerSec, Burst int}`、`AuthConfig{StateSecret string, SessionTTL time.Duration}`、`WorkerConfig{Concurrency int, PollInterval time.Duration}`、`LogConfig{Level, Format string}`
+  - `config.Load(dir string) (Config, error)` — 按 `APP_ENV` 合并 YAML 并叠加环境变量，校验失败返回错误
+  - `(MySQLConfig).DSN() string`
+  - `config.ErrMissingSecret`
+  - `logging.New(level, format string) *slog.Logger`
+  - `logging.SteamID(id uint64) slog.Attr` — 统一的 SteamID 日志属性
+  - `store.NewDB(dsn string, lg *slog.Logger) (*gorm.DB, error)`
+  - `store.NewRedis(addr, password string, db int) (*redis.Client, error)`
+  - `scripts/db/init.sql` 中的全部表结构（后续所有任务的 GORM 模型必须与之一致）
 
 - [ ] **Step 1: 初始化 module 与依赖**
 
@@ -102,11 +120,91 @@ go mod init steamlink
 go get gorm.io/gorm gorm.io/driver/mysql
 go get github.com/redis/go-redis/v9
 go get github.com/gin-gonic/gin
+go get github.com/spf13/viper
 go get github.com/stretchr/testify
-go get -tool github.com/golang-migrate/migrate/v4/cmd/migrate
 ```
 
-- [ ] **Step 2: 写配置加载的失败测试**
+- [ ] **Step 2: 写分环境配置文件**
+
+创建 `configs/config.yaml`（基础配置，所有环境共享）：
+
+```yaml
+# 敏感项一律留空，由 STEAMLINK_* 环境变量注入。
+# 本文件会提交到仓库，任何写在这里的密钥都等同于公开。
+app:
+  env: dev
+
+http:
+  addr: ":8080"
+  # 站点根地址，派生出 OpenID 的两个参数：
+  #   openid.realm     = {base_url}
+  #   openid.return_to = {base_url}/auth/steam/callback?state=...
+  # Steam 会校验 return_to 落在 realm 之下（同 scheme/host/port）。
+  #
+  # 它需要「用户的浏览器」能访问，而非「Steam 的服务器」能访问 ——
+  # Steam 是用 302 把用户浏览器重定向回来的，不存在服务端回调。
+  # 因此本地开发用 localhost 完全可行，无需内网穿透。
+  base_url: "http://localhost:8080"
+
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: ""          # ← STEAMLINK_MYSQL_PASSWORD
+  database: "steamlink"
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+steam:
+  api_key: ""           # ← STEAMLINK_STEAM_API_KEY
+  # 令牌桶参数。社区实测持续 1 req/s 绝对安全，突发 10+ 会触发 429，
+  # 5 req/s 是留了余量的取值。
+  rate_per_sec: 5
+  burst: 20
+
+auth:
+  state_secret: ""      # ← STEAMLINK_AUTH_STATE_SECRET
+  session_ttl: 24h
+
+worker:
+  concurrency: 4
+  poll_interval: 2s
+
+log:
+  level: info
+  format: json
+```
+
+创建 `configs/config.dev.yaml`：
+
+```yaml
+mysql:
+  password: "root"
+
+log:
+  level: debug
+  format: text
+```
+
+创建 `configs/config.prod.yaml`：
+
+```yaml
+# base_url 刻意留空：生产域名必须由 STEAMLINK_HTTP_BASE_URL 显式提供。
+# 若沿用默认的 localhost，OpenID 回调会静默失败且难以排查。
+http:
+  base_url: ""
+
+log:
+  level: info
+  format: json
+```
+
+> **`configs/` 必须加入 `.gitignore` 的例外管理**：本目录要提交，但绝不能有真实密钥。dev 环境的 `mysql.password: "root"` 是本地容器的固定密码，不构成泄漏。
+
+- [ ] **Step 3: 写配置加载的测试**
 
 创建 `internal/config/config_test.go`：
 
@@ -115,37 +213,128 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestLoad_MissingRequiredKeyFails(t *testing.T) {
-	t.Setenv("STEAM_API_KEY", "")
-	t.Setenv("MYSQL_DSN", "root@tcp(127.0.0.1:3306)/steamlink")
+// 测试统一指向仓库中的真实配置目录，避免测试与生产读到不同的结构。
+const testConfigDir = "../../configs"
 
-	_, err := Load()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "STEAM_API_KEY")
+func setSecrets(t *testing.T) {
+	t.Helper()
+	t.Setenv("STEAMLINK_STEAM_API_KEY", "TESTKEY")
+	t.Setenv("STEAMLINK_MYSQL_PASSWORD", "testpass")
+	t.Setenv("STEAMLINK_AUTH_STATE_SECRET", "test-state-secret")
 }
 
-func TestLoad_AppliesDefaults(t *testing.T) {
-	t.Setenv("STEAM_API_KEY", "ABC123")
-	t.Setenv("MYSQL_DSN", "root@tcp(127.0.0.1:3306)/steamlink")
+func TestLoad_MergesBaseAndEnvFiles(t *testing.T) {
+	t.Setenv("APP_ENV", "dev")
+	setSecrets(t)
 
-	cfg, err := Load()
+	cfg, err := Load(testConfigDir)
 	require.NoError(t, err)
-	require.Equal(t, "ABC123", cfg.SteamAPIKey)
-	require.Equal(t, "127.0.0.1:6379", cfg.RedisAddr) // 默认值
-	require.Equal(t, ":8080", cfg.HTTPAddr)           // 默认值
+
+	// 来自基础配置
+	require.Equal(t, ":8080", cfg.HTTP.Addr)
+	require.Equal(t, 3306, cfg.MySQL.Port)
+	require.Equal(t, 5, cfg.Steam.RatePerSec)
+	// 被 dev 覆盖
+	require.Equal(t, "debug", cfg.Log.Level)
+	require.Equal(t, "text", cfg.Log.Format)
+}
+
+// 环境变量优先级最高，覆盖两个 YAML。
+func TestLoad_EnvOverridesYAML(t *testing.T) {
+	t.Setenv("APP_ENV", "dev")
+	setSecrets(t)
+	t.Setenv("STEAMLINK_HTTP_ADDR", ":9999")
+	t.Setenv("STEAMLINK_LOG_LEVEL", "warn")
+
+	cfg, err := Load(testConfigDir)
+	require.NoError(t, err)
+	require.Equal(t, ":9999", cfg.HTTP.Addr)
+	require.Equal(t, "warn", cfg.Log.Level)
+}
+
+// 这是 viper 最经典的坑：AutomaticEnv 只在 Get 时生效，
+// Unmarshal 走 AllKeys，若某个 key 不在任何 YAML 中就读不到环境变量。
+// 三个敏感项在 YAML 中留空正是为了让它们出现在 AllKeys 里，
+// 同时实现里还要显式 BindEnv 作为双保险。此用例守住这个行为。
+func TestLoad_SecretsComeFromEnvNotYAML(t *testing.T) {
+	t.Setenv("APP_ENV", "dev")
+	setSecrets(t)
+
+	cfg, err := Load(testConfigDir)
+	require.NoError(t, err)
+	require.Equal(t, "TESTKEY", cfg.Steam.APIKey)
+	require.Equal(t, "test-state-secret", cfg.Auth.StateSecret)
+	require.Equal(t, "testpass", cfg.MySQL.Password)
+}
+
+// 缺失敏感项必须启动即失败，而不是等到第一次调用 Steam 才暴露。
+func TestLoad_MissingSecretFails(t *testing.T) {
+	t.Setenv("APP_ENV", "dev")
+	t.Setenv("STEAMLINK_STEAM_API_KEY", "")
+	t.Setenv("STEAMLINK_MYSQL_PASSWORD", "testpass")
+	t.Setenv("STEAMLINK_AUTH_STATE_SECRET", "test-state-secret")
+
+	_, err := Load(testConfigDir)
+	require.ErrorIs(t, err, ErrMissingSecret)
+	require.Contains(t, err.Error(), "STEAMLINK_STEAM_API_KEY")
+}
+
+// 生产环境必须显式提供 base_url 且为 https ——
+// 沿用 localhost 会让 OpenID 回调静默失败，极难排查。
+func TestLoad_ProdRequiresHTTPSBaseURL(t *testing.T) {
+	t.Setenv("APP_ENV", "prod")
+	setSecrets(t)
+
+	_, err := Load(testConfigDir)
+	require.Error(t, err, "prod 下 base_url 为空必须失败")
+
+	t.Setenv("STEAMLINK_HTTP_BASE_URL", "http://example.com")
+	_, err = Load(testConfigDir)
+	require.Error(t, err, "prod 下必须是 https")
+
+	t.Setenv("STEAMLINK_HTTP_BASE_URL", "https://example.com")
+	cfg, err := Load(testConfigDir)
+	require.NoError(t, err)
+	require.Equal(t, "https://example.com", cfg.HTTP.BaseURL)
+}
+
+// duration 字符串必须能被解析成 time.Duration。
+func TestLoad_ParsesDurations(t *testing.T) {
+	t.Setenv("APP_ENV", "dev")
+	setSecrets(t)
+
+	cfg, err := Load(testConfigDir)
+	require.NoError(t, err)
+	require.Equal(t, 24*time.Hour, cfg.Auth.SessionTTL)
+	require.Equal(t, 2*time.Second, cfg.Worker.PollInterval)
+}
+
+// DSN 必须强制带上 parseTime 与 UTC，不允许配置文件改动它们。
+func TestMySQLDSN_ForcesParseTimeAndUTC(t *testing.T) {
+	c := MySQLConfig{
+		Host: "db.internal", Port: 3306,
+		User: "app", Password: "pw", Database: "steamlink",
+	}
+	dsn := c.DSN()
+
+	require.Contains(t, dsn, "app:pw@tcp(db.internal:3306)/steamlink")
+	require.Contains(t, dsn, "parseTime=true")
+	require.Contains(t, dsn, "loc=UTC")
+	require.Contains(t, dsn, "charset=utf8mb4")
 }
 ```
 
-- [ ] **Step 3: 运行测试确认失败**
+- [ ] **Step 4: 运行测试确认失败**
 
 Run: `go test ./internal/config/ -v`
 Expected: FAIL —— `undefined: Load`
 
-- [ ] **Step 4: 实现配置加载**
+- [ ] **Step 5: 实现配置加载**
 
 创建 `internal/config/config.go`：
 
@@ -153,71 +342,297 @@ Expected: FAIL —— `undefined: Load`
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"time"
+
+	"github.com/spf13/viper"
 )
 
+// ErrMissingSecret 表示必需的敏感配置项为空。
+var ErrMissingSecret = errors.New("config: required secret is empty")
+
+// EnvPrefix 是环境变量前缀。steam.api_key 对应 STEAMLINK_STEAM_API_KEY。
+const EnvPrefix = "STEAMLINK"
+
 type Config struct {
-	MySQLDSN      string
-	RedisAddr     string
-	RedisPassword string
-	SteamAPIKey   string
-	BaseURL       string // 对外可访问的站点地址，用于 OpenID realm / return_to
-	HTTPAddr      string
+	App    AppConfig    `mapstructure:"app"`
+	HTTP   HTTPConfig   `mapstructure:"http"`
+	MySQL  MySQLConfig  `mapstructure:"mysql"`
+	Redis  RedisConfig  `mapstructure:"redis"`
+	Steam  SteamConfig  `mapstructure:"steam"`
+	Auth   AuthConfig   `mapstructure:"auth"`
+	Worker WorkerConfig `mapstructure:"worker"`
+	Log    LogConfig    `mapstructure:"log"`
 }
 
-func Load() (Config, error) {
-	cfg := Config{
-		MySQLDSN:      os.Getenv("MYSQL_DSN"),
-		RedisAddr:     envOr("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword: os.Getenv("REDIS_PASSWORD"),
-		SteamAPIKey:   os.Getenv("STEAM_API_KEY"),
-		BaseURL:       envOr("BASE_URL", "http://localhost:8080"),
-		HTTPAddr:      envOr("HTTP_ADDR", ":8080"),
+type AppConfig struct {
+	Env string `mapstructure:"env"`
+}
+
+type HTTPConfig struct {
+	Addr    string `mapstructure:"addr"`
+	BaseURL string `mapstructure:"base_url"`
+}
+
+type MySQLConfig struct {
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	Database string `mapstructure:"database"`
+}
+
+// DSN 拼装连接串。
+//
+// parseTime=true 与 loc=UTC 是硬编码的、不可配置的：
+// 前者缺失会导致 DATETIME 列无法扫描进 time.Time，
+// 后者缺失会让 worker 与数据库时区不一致，直接产生错误的会话时刻。
+// 这是正确性要求，不是可调项。
+func (c MySQLConfig) DSN() string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&loc=UTC&charset=utf8mb4",
+		c.User, c.Password, c.Host, c.Port, c.Database)
+}
+
+type RedisConfig struct {
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
+}
+
+type SteamConfig struct {
+	APIKey     string `mapstructure:"api_key"`
+	RatePerSec int    `mapstructure:"rate_per_sec"`
+	Burst      int    `mapstructure:"burst"`
+}
+
+type AuthConfig struct {
+	StateSecret string        `mapstructure:"state_secret"`
+	SessionTTL  time.Duration `mapstructure:"session_ttl"`
+}
+
+type WorkerConfig struct {
+	Concurrency  int           `mapstructure:"concurrency"`
+	PollInterval time.Duration `mapstructure:"poll_interval"`
+}
+
+type LogConfig struct {
+	Level  string `mapstructure:"level"`
+	Format string `mapstructure:"format"`
+}
+
+// secretBindings 是必须由环境变量提供的敏感项。
+// 显式 BindEnv 而非只依赖 AutomaticEnv：后者只在 Get 时生效，
+// Unmarshal 走 AllKeys，一旦某个 key 不在 YAML 中就会被静默跳过。
+var secretBindings = map[string]string{
+	"steam.api_key":     EnvPrefix + "_STEAM_API_KEY",
+	"mysql.password":    EnvPrefix + "_MYSQL_PASSWORD",
+	"auth.state_secret": EnvPrefix + "_AUTH_STATE_SECRET",
+}
+
+// Load 按三层优先级加载配置：
+//
+//	configs/config.yaml        基础值
+//	configs/config.{env}.yaml  环境覆盖
+//	STEAMLINK_* 环境变量        最高优先级
+//
+// env 取自 APP_ENV，缺省为 dev。
+func Load(dir string) (Config, error) {
+	env := os.Getenv("APP_ENV")
+	if env == "" {
+		env = "dev"
 	}
 
-	for name, v := range map[string]string{
-		"MYSQL_DSN":     cfg.MySQLDSN,
-		"STEAM_API_KEY": cfg.SteamAPIKey,
-	} {
-		if v == "" {
-			return Config{}, fmt.Errorf("config: required env %s is empty", name)
+	v := viper.New()
+	v.SetConfigType("yaml")
+	v.AddConfigPath(dir)
+
+	v.SetConfigName("config")
+	if err := v.ReadInConfig(); err != nil {
+		return Config{}, fmt.Errorf("config: 读取基础配置失败: %w", err)
+	}
+
+	v.SetConfigName("config." + env)
+	if err := v.MergeInConfig(); err != nil {
+		var notFound viper.ConfigFileNotFoundError
+		if !errors.As(err, &notFound) && !os.IsNotExist(err) {
+			return Config{}, fmt.Errorf("config: 合并 %s 环境配置失败: %w", env, err)
 		}
+		// 环境专属文件可以不存在，此时仅使用基础配置
+	}
+
+	v.SetEnvPrefix(EnvPrefix)
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	for key, envName := range secretBindings {
+		if err := v.BindEnv(key, envName); err != nil {
+			return Config{}, err
+		}
+	}
+
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return Config{}, fmt.Errorf("config: 解析配置失败: %w", err)
+	}
+	cfg.App.Env = env
+
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
 	}
 	return cfg, nil
 }
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// validate 在启动时一次性暴露所有配置问题。
+// 启动即失败远好于运行时才发现 —— 后者会让服务带着残缺配置对外提供服务。
+func (c Config) validate() error {
+	for key, envName := range secretBindings {
+		var val string
+		switch key {
+		case "steam.api_key":
+			val = c.Steam.APIKey
+		case "mysql.password":
+			val = c.MySQL.Password
+		case "auth.state_secret":
+			val = c.Auth.StateSecret
+		}
+		if val == "" {
+			return fmt.Errorf("%w: %s（请设置环境变量 %s）", ErrMissingSecret, key, envName)
+		}
 	}
-	return def
+
+	if c.App.Env == "prod" {
+		if c.HTTP.BaseURL == "" {
+			return fmt.Errorf("config: prod 环境必须设置 %s_HTTP_BASE_URL", EnvPrefix)
+		}
+		if !strings.HasPrefix(c.HTTP.BaseURL, "https://") {
+			return fmt.Errorf("config: prod 环境的 http.base_url 必须是 https，当前为 %q", c.HTTP.BaseURL)
+		}
+	}
+
+	if c.Steam.RatePerSec <= 0 || c.Steam.Burst <= 0 {
+		return fmt.Errorf("config: steam.rate_per_sec 与 steam.burst 必须为正数")
+	}
+	if c.Worker.Concurrency <= 0 {
+		return fmt.Errorf("config: worker.concurrency 必须为正数")
+	}
+	return nil
 }
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [ ] **Step 6: 运行测试确认通过**
 
 Run: `go test ./internal/config/ -v`
-Expected: PASS（两个用例）
+Expected: PASS（7 个用例）
 
-- [ ] **Step 6: 写迁移 SQL**
+若 `TestLoad_SecretsComeFromEnvNotYAML` 失败，检查 `configs/config.yaml` 中三个敏感 key 是否确实存在（值为空字符串），以及 `BindEnv` 是否对全部三项都调用了。
 
-创建 `migrations/000001_init.up.sql`，内容为 `docs/01-design.md` §5.1 的完整 DDL（八张表：`steam_links`、`apps`、`app_achievements`、`user_games`、`play_sessions`、`achievement_unlocks`、`probe_state`、`sync_tasks`），逐字照抄，不得改动字段名、类型或索引。
+- [ ] **Step 7: 写日志包的测试与实现**
 
-创建 `migrations/000001_init.down.sql`：
+创建 `internal/logging/logging_test.go`：
 
-```sql
-DROP TABLE IF EXISTS sync_tasks;
-DROP TABLE IF EXISTS probe_state;
-DROP TABLE IF EXISTS achievement_unlocks;
-DROP TABLE IF EXISTS play_sessions;
-DROP TABLE IF EXISTS user_games;
-DROP TABLE IF EXISTS app_achievements;
-DROP TABLE IF EXISTS apps;
-DROP TABLE IF EXISTS steam_links;
+```go
+package logging
+
+import (
+	"log/slog"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestNew_RespectsLevelAndFormat(t *testing.T) {
+	lg := New("debug", "text")
+	require.True(t, lg.Enabled(nil, slog.LevelDebug))
+
+	lg = New("warn", "json")
+	require.False(t, lg.Enabled(nil, slog.LevelInfo))
+	require.True(t, lg.Enabled(nil, slog.LevelWarn))
+}
+
+// 未知级别退化到 Info，而不是 panic 或静默丢弃全部日志。
+func TestNew_UnknownLevelFallsBackToInfo(t *testing.T) {
+	lg := New("verbose", "json")
+	require.True(t, lg.Enabled(nil, slog.LevelInfo))
+	require.False(t, lg.Enabled(nil, slog.LevelDebug))
+}
+
+// SteamID 必须以字符串输出：日志采集链路多经 JSON，
+// 7.6×10^16 的数字会丢精度，变成一个不存在的账号。
+func TestSteamID_IsString(t *testing.T) {
+	attr := SteamID(76561197960287930)
+	require.Equal(t, "steam_id", attr.Key)
+	require.Equal(t, slog.KindString, attr.Value.Kind())
+	require.Equal(t, "76561197960287930", attr.Value.String())
+}
 ```
 
-- [ ] **Step 7: 写 docker-compose 与连接构造**
+创建 `internal/logging/logging.go`：
+
+```go
+// Package logging 构造标准库 slog 的 Logger。
+// 全项目禁止 fmt.Printf / log.Printf，也不依赖 slog.Default()：
+// Logger 一律通过依赖注入传递，便于测试静默与附加组件标识。
+package logging
+
+import (
+	"log/slog"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// New 按级别与格式构造 Logger。format 为 "text" 时用 TextHandler，
+// 其余情况一律 JSONHandler（生产默认）。
+func New(level, format string) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLevel(level)}
+
+	var h slog.Handler
+	if strings.EqualFold(format, "text") {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	}
+	return slog.New(h)
+}
+
+// parseLevel 把配置字符串映射到 slog 级别，未知值退化到 Info。
+func parseLevel(s string) slog.Level {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// SteamID 返回统一的 SteamID 日志属性。
+//
+// 必须以字符串输出：SteamID64 约 7.6×10^16，超过 JavaScript 与多数
+// JSON 日志处理链路的安全整数范围，以数字记录会静默丢精度。
+func SteamID(id uint64) slog.Attr {
+	return slog.String("steam_id", strconv.FormatUint(id, 10))
+}
+```
+
+Run: `go test ./internal/logging/ -v`
+Expected: PASS（3 个用例）
+
+- [ ] **Step 8: 写 DDL 与开发脚本**
+
+创建 `scripts/db/init.sql`，内容为 `docs/01-design.md` §5.1 的完整 DDL（八张表：`steam_links`、`apps`、`app_achievements`、`user_games`、`play_sessions`、`achievement_unlocks`、`probe_state`、`sync_tasks`），逐字照抄，不得改动字段名、类型或索引。文件开头加一行：
+
+```sql
+-- 表结构初始化。后续变更请新增 scripts/db/migrations/NNN_描述.sql，
+-- 不要修改本文件 —— 否则已部署环境与新建环境会产生结构漂移。
+```
+
+创建空目录 `scripts/db/migrations/`（放一个 `.gitkeep`）。
 
 创建 `docker-compose.yml`：
 
@@ -230,10 +645,61 @@ services:
       MYSQL_DATABASE: steamlink
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
     ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      retries: 20
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
 ```
+
+创建 `scripts/dev/up.sh`：
+
+```bash
+#!/usr/bin/env bash
+# 起本地依赖并初始化数据库。可重复执行。
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+
+docker compose up -d --wait
+
+echo "==> 应用 scripts/db/init.sql"
+docker compose exec -T mysql mysql -uroot -proot steamlink < scripts/db/init.sql
+
+echo "==> 应用增量脚本"
+for f in scripts/db/migrations/*.sql; do
+  [ -e "$f" ] || continue
+  echo "    $f"
+  docker compose exec -T mysql mysql -uroot -proot steamlink < "$f"
+done
+
+echo "==> 完成"
+```
+
+创建 `scripts/dev/test.sh`：
+
+```bash
+#!/usr/bin/env bash
+# 跑全量测试。集成测试需要本地 MySQL 与 Redis 已就绪。
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+
+go vet ./...
+go test ./... "$@"
+```
+
+赋予执行权限：
+
+```bash
+chmod +x scripts/dev/up.sh scripts/dev/test.sh
+```
+
+> `init.sql` 中的 `CREATE TABLE` 建议写成 `CREATE TABLE IF NOT EXISTS`，让 `up.sh` 可以重复执行而不报错。
+
+- [ ] **Step 9: 实现数据库与 Redis 连接**
 
 创建 `internal/store/db.go`：
 
@@ -241,19 +707,75 @@ services:
 package store
 
 import (
+	"context"
+	"log/slog"
+	"time"
+
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
+	gormlogger "gorm.io/gorm/logger"
 )
 
-// NewDB 构造 GORM 连接。DSN 必须带 parseTime=true 与 loc=UTC，
-// 否则 DATETIME 列无法正确扫描进 time.Time。
-func NewDB(dsn string) (*gorm.DB, error) {
+// NewDB 构造 GORM 连接，并把 GORM 自身的日志桥接到 slog。
+func NewDB(dsn string, lg *slog.Logger) (*gorm.DB, error) {
 	return gorm.Open(mysql.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Warn),
+		Logger: newGormSlogLogger(lg),
 		// 全部时间统一按 UTC 处理，避免 worker 与 DB 时区不一致导致会话时刻错乱
 		NowFunc: nowUTC,
 	})
+}
+
+func nowUTC() time.Time { return time.Now().UTC() }
+
+// gormSlogLogger 把 GORM 的日志接口适配到 slog，
+// 避免 GORM 绕过项目的日志规范直接写 stdout。
+type gormSlogLogger struct {
+	lg            *slog.Logger
+	slowThreshold time.Duration
+}
+
+func newGormSlogLogger(lg *slog.Logger) gormlogger.Interface {
+	return &gormSlogLogger{
+		lg:            lg.With("component", "gorm"),
+		slowThreshold: 200 * time.Millisecond,
+	}
+}
+
+func (l *gormSlogLogger) LogMode(gormlogger.LogLevel) gormlogger.Interface { return l }
+
+func (l *gormSlogLogger) Info(ctx context.Context, msg string, args ...any) {
+	l.lg.InfoContext(ctx, msg, slog.Any("args", args))
+}
+
+func (l *gormSlogLogger) Warn(ctx context.Context, msg string, args ...any) {
+	l.lg.WarnContext(ctx, msg, slog.Any("args", args))
+}
+
+func (l *gormSlogLogger) Error(ctx context.Context, msg string, args ...any) {
+	l.lg.ErrorContext(ctx, msg, slog.Any("args", args))
+}
+
+func (l *gormSlogLogger) Trace(ctx context.Context, begin time.Time,
+	fc func() (string, int64), err error) {
+
+	elapsed := time.Since(begin)
+	sql, rows := fc()
+
+	switch {
+	case err != nil && err != gorm.ErrRecordNotFound:
+		// ErrRecordNotFound 是正常的业务分支，不该记为错误
+		l.lg.ErrorContext(ctx, "SQL 执行失败",
+			slog.String("sql", sql), slog.Int64("rows", rows),
+			slog.Duration("elapsed", elapsed), slog.String("err", err.Error()))
+	case elapsed > l.slowThreshold:
+		l.lg.WarnContext(ctx, "慢查询",
+			slog.String("sql", sql), slog.Int64("rows", rows),
+			slog.Duration("elapsed", elapsed))
+	default:
+		l.lg.DebugContext(ctx, "SQL",
+			slog.String("sql", sql), slog.Int64("rows", rows),
+			slog.Duration("elapsed", elapsed))
+	}
 }
 ```
 
@@ -262,30 +784,36 @@ func NewDB(dsn string) (*gorm.DB, error) {
 ```go
 package store
 
-import "github.com/redis/go-redis/v9"
+import (
+	"context"
+	"fmt"
+	"time"
 
-func NewRedis(addr, password string) (*redis.Client, error) {
-	c := redis.NewClient(&redis.Options{Addr: addr, Password: password})
+	"github.com/redis/go-redis/v9"
+)
+
+// NewRedis 构造客户端并做一次连通性探测 ——
+// Redis 承担限流闸门，连不上时应当启动即失败而非运行时才暴露。
+func NewRedis(addr, password string, db int) (*redis.Client, error) {
+	c := redis.NewClient(&redis.Options{Addr: addr, Password: password, DB: db})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := c.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("store: 连接 Redis 失败: %w", err)
+	}
 	return c, nil
 }
 ```
 
-在 `db.go` 中补上 `nowUTC`：
-
-```go
-import "time"
-
-func nowUTC() time.Time { return time.Now().UTC() }
-```
-
-- [ ] **Step 8: 启动依赖并执行迁移，验证建表**
+- [ ] **Step 10: 启动依赖并验证建表**
 
 ```bash
-docker compose up -d
-go tool migrate -path migrations -database "mysql://root:root@tcp(127.0.0.1:3306)/steamlink" up
+./scripts/dev/up.sh
 ```
 
-Expected: 输出 `1/u init (...)`，无错误
+Expected: 输出 `==> 完成`，无错误
 
 验证生成列与字符集确实生效：
 
@@ -295,11 +823,18 @@ docker compose exec mysql mysql -uroot -proot steamlink -e "SHOW CREATE TABLE st
 
 Expected: 输出中包含 `active_steam_id ... GENERATED ALWAYS AS` 与 `utf8mb4_0900_ai_ci`。若生成列缺失，说明 MySQL 版本过低，停止后续任务并升级。
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 11: 运行全部测试并提交**
+
+```bash
+STEAMLINK_STEAM_API_KEY=x STEAMLINK_MYSQL_PASSWORD=root \
+STEAMLINK_AUTH_STATE_SECRET=x ./scripts/dev/test.sh
+```
+
+Expected: 全绿
 
 ```bash
 git init && git add -A
-git commit -m "feat: 项目骨架、配置加载与数据库迁移"
+git commit -m "feat: 项目骨架、YAML 分环境配置、slog 日志与数据库初始化"
 ```
 
 ---
@@ -1634,6 +2169,7 @@ func (SyncTask) TableName() string { return "sync_tasks" }
 package store
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 
@@ -1650,10 +2186,13 @@ func testDSN() string {
 	return "root:root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
 }
 
+// testLogger 静默日志输出，避免测试被 SQL trace 淹没。
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
 func testDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := NewDB(testDSN())
-	require.NoError(t, err, "需要本地 MySQL 且已执行迁移：docker compose up -d && go tool migrate ... up")
+	db, err := NewDB(testDSN(), testLogger())
+	require.NoError(t, err, "需要本地 MySQL 且已初始化：./scripts/dev/up.sh")
 
 	// 每个用例前清空，保证互不干扰
 	for _, tbl := range []string{
@@ -2022,7 +2561,7 @@ func TestGameRepo_PlaytimeMap(t *testing.T) {
 ```go
 func testDBHandle(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := NewDB(testDSN())
+	db, err := NewDB(testDSN(), testLogger())
 	require.NoError(t, err)
 	return db
 }
@@ -2708,6 +3247,8 @@ func (d Deps) probeAndPersist(c *gin.Context, steamID uint64) LinkStatusResponse
 package api
 
 import (
+	"log/slog"
+
 	"github.com/gin-gonic/gin"
 
 	"steamlink/internal/auth"
@@ -2725,9 +3266,17 @@ type Deps struct {
 	Tasks       task.Queue
 	BaseURL     string
 	StateSecret []byte
+	Logger      *slog.Logger
 }
 
 func NewRouter(d Deps) *gin.Engine {
+	if d.Logger == nil {
+		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	d.Logger = d.Logger.With("component", "api")
+
+	// gin 默认的 Logger 中间件直接写 stdout，绕过项目日志规范，因此不使用。
+	// 用 gin.New() 而非 gin.Default()，只保留 Recovery。
 	r := gin.New()
 	r.Use(gin.Recovery())
 
@@ -2753,56 +3302,75 @@ func NewRouter(d Deps) *gin.Engine {
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
-	"time"
 
 	"steamlink/internal/api"
 	"steamlink/internal/auth"
 	"steamlink/internal/config"
+	"steamlink/internal/logging"
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
 )
 
+// configDir 可由 CONFIG_DIR 覆盖，便于容器中挂载到别处。
+func configDir() string {
+	if v := os.Getenv("CONFIG_DIR"); v != "" {
+		return v
+	}
+	return "configs"
+}
+
 func main() {
-	cfg, err := config.Load()
+	cfg, err := config.Load(configDir())
 	if err != nil {
-		log.Fatalf("配置加载失败: %v", err)
+		// 此刻 Logger 尚未构造，配置错误用 stderr 直出并退出。
+		// 这是全项目唯一允许绕过 slog 的地方。
+		os.Stderr.WriteString("配置加载失败: " + err.Error() + "\n")
+		os.Exit(1)
 	}
 
-	db, err := store.NewDB(cfg.MySQLDSN)
+	lg := logging.New(cfg.Log.Level, cfg.Log.Format).With(
+		slog.String("service", "api"),
+		slog.String("env", cfg.App.Env),
+	)
+
+	db, err := store.NewDB(cfg.MySQL.DSN(), lg)
 	if err != nil {
-		log.Fatalf("MySQL 连接失败: %v", err)
+		lg.Error("MySQL 连接失败", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
-	rdb, err := store.NewRedis(cfg.RedisAddr, cfg.RedisPassword)
+	rdb, err := store.NewRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
-		log.Fatalf("Redis 连接失败: %v", err)
+		lg.Error("Redis 连接失败", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
 
-	secret := os.Getenv("STATE_SECRET")
-	if secret == "" {
-		log.Fatal("STATE_SECRET 未设置：CSRF state 签名密钥不可为空")
-	}
-
-	limiter := steam.NewRedisLimiter(rdb, 5, 20)
-	sc := steam.New(cfg.SteamAPIKey, steam.WithLimiter(limiter))
+	limiter := steam.NewRedisLimiter(rdb, cfg.Steam.RatePerSec, cfg.Steam.Burst)
+	sc := steam.New(cfg.Steam.APIKey, steam.WithLimiter(limiter))
 
 	r := api.NewRouter(api.Deps{
 		Links:       store.NewLinkRepo(db),
 		Games:       store.NewGameRepo(db),
 		Steam:       sc,
 		Verifier:    auth.NewVerifier(),
-		Auth:        auth.NewSessionStore(rdb, 24*time.Hour),
-		BaseURL:     cfg.BaseURL,
-		StateSecret: []byte(secret),
+		Auth:        auth.NewSessionStore(rdb, cfg.Auth.SessionTTL),
+		BaseURL:     cfg.HTTP.BaseURL,
+		StateSecret: []byte(cfg.Auth.StateSecret),
+		Logger:      lg,
 	})
 
-	log.Printf("API 监听 %s", cfg.HTTPAddr)
-	if err := r.Run(cfg.HTTPAddr); err != nil {
-		log.Fatal(err)
+	lg.Info("API 启动", slog.String("addr", cfg.HTTP.Addr),
+		slog.String("base_url", cfg.HTTP.BaseURL))
+
+	if err := r.Run(cfg.HTTP.Addr); err != nil {
+		lg.Error("HTTP 服务退出", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
 }
 ```
+
+> `api.Deps` 需要增加 `Logger *slog.Logger` 字段。同时把 `handleLogin` 等 handler 中可能的错误日志改为 `d.Logger.Error(...)`。
 
 - [ ] **Step 11: 编译并运行全部测试**
 
@@ -3111,6 +3679,7 @@ type Queue interface {
 package task
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 
@@ -3120,14 +3689,16 @@ import (
 	"steamlink/internal/store"
 )
 
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
 func testDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_MYSQL_DSN")
 	if dsn == "" {
 		dsn = "root:root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
 	}
-	db, err := store.NewDB(dsn)
-	require.NoError(t, err, "需要本地 MySQL 并已执行迁移")
+	db, err := store.NewDB(dsn, testLogger())
+	require.NoError(t, err, "需要本地 MySQL 并已初始化：./scripts/dev/up.sh")
 	require.NoError(t, db.Exec("DELETE FROM sync_tasks").Error)
 	return db
 }
@@ -4460,6 +5031,7 @@ func (s *partialSteam) GetPlayerSummaries(_ context.Context, ids []uint64) ([]st
 package collector
 
 import (
+	"log/slog"
 	"os"
 	"testing"
 
@@ -4469,14 +5041,16 @@ import (
 	"steamlink/internal/store"
 )
 
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
 func storeTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_MYSQL_DSN")
 	if dsn == "" {
 		dsn = "root:root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
 	}
-	db, err := store.NewDB(dsn)
-	require.NoError(t, err, "需要本地 MySQL 并已执行迁移")
+	db, err := store.NewDB(dsn, testLogger())
+	require.NoError(t, err, "需要本地 MySQL 并已初始化：./scripts/dev/up.sh")
 
 	for _, tbl := range []string{
 		"sync_tasks", "probe_state", "achievement_unlocks",
@@ -4506,9 +5080,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"steamlink/internal/domain"
+	"steamlink/internal/logging"
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
 	"steamlink/internal/task"
@@ -4529,15 +5105,22 @@ type ProberDeps struct {
 	Probes *store.ProbeRepo
 	Tasks  task.Queue
 	Now    func() time.Time
+	Logger *slog.Logger
 }
 
-type Prober struct{ d ProberDeps }
+type Prober struct {
+	d  ProberDeps
+	lg *slog.Logger
+}
 
 func NewProber(d ProberDeps) *Prober {
 	if d.Now == nil {
 		d.Now = func() time.Time { return time.Now().UTC() }
 	}
-	return &Prober{d: d}
+	if d.Logger == nil {
+		d.Logger = slog.New(slog.DiscardHandler)
+	}
+	return &Prober{d: d, lg: d.Logger.With("component", "prober")}
 }
 
 // RunOnce 执行一轮探测：取出到期用户 → 分批调用 → 推进状态机 → 落库并入队。
@@ -4571,6 +5154,8 @@ func (p *Prober) runBatch(ctx context.Context, batch []store.ProbeState, now tim
 	if err != nil {
 		// 关键：请求失败与「用户没在玩」是两回事。直接返回，
 		// 保持所有状态不变，等下一轮重试。绝不能把空结果喂给状态机。
+		p.lg.Warn("探针批次请求失败，本轮跳过且状态不变",
+			slog.Int("batch_size", len(ids)), slog.String("err", err.Error()))
 		return fmt.Errorf("collector: 探针请求失败: %w", err)
 	}
 
@@ -4579,16 +5164,25 @@ func (p *Prober) runBatch(ctx context.Context, batch []store.ProbeState, now tim
 		observed[s.SteamID] = s.GameID
 	}
 
+	var missing int
 	for _, row := range batch {
 		gameID, present := observed[row.SteamID]
 		if !present {
 			// 响应中缺失该用户（账号被封、SteamID 失效等）。
 			// 同样不能判定为「没在玩」，跳过本轮。
+			missing++
+			p.lg.Debug("响应中缺失该用户，跳过本轮", logging.SteamID(row.SteamID))
 			continue
 		}
 		if err := p.advanceOne(ctx, row, gameID, now); err != nil {
 			return err
 		}
+	}
+
+	// 持续性的缺失说明有一批账号已失效，值得在运维层面关注
+	if missing > 0 {
+		p.lg.Info("探针批次存在缺失用户",
+			slog.Int("missing", missing), slog.Int("batch_size", len(ids)))
 	}
 	return nil
 }
@@ -4702,7 +5296,7 @@ git commit -m "feat(collector): L0 批量探针与会话事件入队"
 - Produces:
   - `task.Handler` 函数类型：`func(ctx context.Context, t Task) error`
   - `task.NewRunner(q Queue, opts RunnerOptions) *Runner`
-  - `task.RunnerOptions` 结构体：`Concurrency int`、`PollInterval time.Duration`、`Lease time.Duration`、`Logf func(string, ...any)`
+  - `task.RunnerOptions` 结构体：`Concurrency int`、`PollInterval time.Duration`、`Lease time.Duration`、`Logger *slog.Logger`
   - `(*Runner).Register(typ int8, h Handler)`
   - `(*Runner).RunOnce(ctx context.Context) (int, error)` — 返回本轮处理的任务数
   - `(*Runner).Start(ctx context.Context)` — 阻塞直到 ctx 取消
@@ -4871,9 +5465,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
+
+	"steamlink/internal/logging"
 )
 
 // ErrPermanent 标记不可恢复的失败。handler 用 %w 包装它返回时，
@@ -4887,13 +5483,14 @@ type RunnerOptions struct {
 	Concurrency  int
 	PollInterval time.Duration
 	Lease        time.Duration
-	Logf         func(string, ...any)
+	Logger       *slog.Logger
 }
 
 type Runner struct {
 	q        Queue
 	handlers map[int8]Handler
 	opts     RunnerOptions
+	lg       *slog.Logger
 }
 
 func NewRunner(q Queue, opts RunnerOptions) *Runner {
@@ -4906,10 +5503,17 @@ func NewRunner(q Queue, opts RunnerOptions) *Runner {
 	if opts.Lease <= 0 {
 		opts.Lease = LeaseDuration
 	}
-	if opts.Logf == nil {
-		opts.Logf = log.Printf
+	// 未注入 Logger 时静默，而不是回退到 slog.Default() ——
+	// 全局默认 Logger 会绕过项目的日志配置，且让测试输出变脏。
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Runner{q: q, handlers: map[int8]Handler{}, opts: opts}
+	return &Runner{
+		q:        q,
+		handlers: map[int8]Handler{},
+		opts:     opts,
+		lg:       opts.Logger.With("component", "task-runner"),
+	}
 }
 
 func (r *Runner) Register(typ int8, h Handler) { r.handlers[typ] = h }
@@ -4942,25 +5546,35 @@ func (r *Runner) RunOnce(ctx context.Context) (int, error) {
 }
 
 func (r *Runner) execute(ctx context.Context, t Task) {
+	lg := r.lg.With(
+		slog.Uint64("task_id", t.ID),
+		slog.Int("task_type", int(t.Type)),
+		logging.SteamID(t.SteamID),
+		slog.Uint64("appid", uint64(t.AppID)),
+	)
+
 	err := r.invoke(ctx, t)
 
 	switch {
 	case err == nil:
+		lg.Debug("任务执行成功")
 		if e := r.q.Succeed(ctx, t.ID); e != nil {
-			r.opts.Logf("task %d 标记成功失败: %v", t.ID, e)
+			lg.Error("标记任务成功失败", slog.String("err", e.Error()))
 		}
 
 	case errors.Is(err, ErrPermanent):
 		// 永久失败也算「处理完毕」：重试没有意义
-		r.opts.Logf("task %d 永久失败，不再重试: %v", t.ID, err)
+		lg.Info("任务永久失败，不再重试", slog.String("err", err.Error()))
 		if e := r.q.Succeed(ctx, t.ID); e != nil {
-			r.opts.Logf("task %d 标记成功失败: %v", t.ID, e)
+			lg.Error("标记任务成功失败", slog.String("err", e.Error()))
 		}
 
 	default:
-		r.opts.Logf("task %d 执行失败: %v", t.ID, err)
+		lg.Warn("任务执行失败，将退避重试",
+			slog.Int("attempts", int(t.Attempts)),
+			slog.String("err", err.Error()))
 		if e := r.q.Fail(ctx, t.ID, err); e != nil {
-			r.opts.Logf("task %d 标记失败失败: %v", t.ID, e)
+			lg.Error("标记任务失败失败", slog.String("err", e.Error()))
 		}
 	}
 }
@@ -4992,7 +5606,7 @@ func (r *Runner) Start(ctx context.Context) {
 
 		n, err := r.RunOnce(ctx)
 		if err != nil {
-			r.opts.Logf("任务轮询失败: %v", err)
+			r.lg.Error("任务轮询失败", slog.String("err", err.Error()))
 		}
 		if n > 0 {
 			continue
@@ -5021,7 +5635,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -5029,37 +5643,57 @@ import (
 
 	"steamlink/internal/collector"
 	"steamlink/internal/config"
+	"steamlink/internal/logging"
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
 	"steamlink/internal/task"
 )
 
+func configDir() string {
+	if v := os.Getenv("CONFIG_DIR"); v != "" {
+		return v
+	}
+	return "configs"
+}
+
 func main() {
-	cfg, err := config.Load()
+	cfg, err := config.Load(configDir())
 	if err != nil {
-		log.Fatalf("配置加载失败: %v", err)
+		os.Stderr.WriteString("配置加载失败: " + err.Error() + "\n")
+		os.Exit(1)
 	}
 
-	db, err := store.NewDB(cfg.MySQLDSN)
+	lg := logging.New(cfg.Log.Level, cfg.Log.Format).With(
+		slog.String("service", "worker"),
+		slog.String("env", cfg.App.Env),
+	)
+
+	db, err := store.NewDB(cfg.MySQL.DSN(), lg)
 	if err != nil {
-		log.Fatalf("MySQL 连接失败: %v", err)
+		lg.Error("MySQL 连接失败", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
-	rdb, err := store.NewRedis(cfg.RedisAddr, cfg.RedisPassword)
+	rdb, err := store.NewRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
-		log.Fatalf("Redis 连接失败: %v", err)
+		lg.Error("Redis 连接失败", slog.String("err", err.Error()))
+		os.Exit(1)
 	}
 
-	limiter := steam.NewRedisLimiter(rdb, 5, 20)
-	sc := steam.New(cfg.SteamAPIKey, steam.WithLimiter(limiter))
+	limiter := steam.NewRedisLimiter(rdb, cfg.Steam.RatePerSec, cfg.Steam.Burst)
+	sc := steam.New(cfg.Steam.APIKey, steam.WithLimiter(limiter))
 
 	queue := task.NewMySQLQueue(db)
 	probes := store.NewProbeRepo(db)
 
 	prober := collector.NewProber(collector.ProberDeps{
-		Steam: sc, Probes: probes, Tasks: queue,
+		Steam: sc, Probes: probes, Tasks: queue, Logger: lg,
 	})
 
-	runner := task.NewRunner(queue, task.RunnerOptions{Concurrency: 4})
+	runner := task.NewRunner(queue, task.RunnerOptions{
+		Concurrency:  cfg.Worker.Concurrency,
+		PollInterval: cfg.Worker.PollInterval,
+		Logger:       lg,
+	})
 	// handler 在 Task 13、14、15、16 中逐步注册
 
 	ctx, stop := signal.NotifyContext(context.Background(),
@@ -5076,19 +5710,20 @@ func main() {
 				return
 			case <-ticker.C:
 				if err := prober.RunOnce(ctx); err != nil {
-					log.Printf("探针轮询失败: %v", err)
+					lg.Warn("探针轮询失败", slog.String("err", err.Error()))
 				}
 			}
 		}
 	}()
 
-	log.Println("worker 已启动")
+	lg.Info("worker 已启动",
+		slog.Int("concurrency", cfg.Worker.Concurrency))
 	runner.Start(ctx)
-	log.Println("worker 已停止")
-
-	_ = os.Stdout.Sync()
+	lg.Info("worker 已停止")
 }
 ```
+
+> `collector.ProberDeps` 需要增加 `Logger *slog.Logger` 字段；`NewProber` 中为 nil 时回退到 `slog.New(slog.DiscardHandler)`，并 `With("component", "prober")`。
 
 > 探针的 ticker 设为 30 秒而非 2 分钟：`next_probe_at` 才是真正的节流阀，ticker 只是驱动检查的节拍，更密的节拍能让分层中不同间隔的用户按时被采集。
 
@@ -6276,7 +6911,7 @@ Expected: PASS（18 个用例）
 	// 启动自愈：结算 worker 宕机期间残留的僵尸会话
 	healer := collector.NewHealer(probes, queue, nil)
 	if err := healer.Run(ctx); err != nil {
-		log.Printf("启动自愈失败: %v", err)
+		lg.Error("启动自愈失败", slog.String("err", err.Error()))
 	}
 
 	// 每日校准调度
@@ -6284,7 +6919,7 @@ Expected: PASS（18 个用例）
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		if err := reconciler.ScheduleDaily(ctx); err != nil {
-			log.Printf("每日校准调度失败: %v", err)
+			lg.Error("每日校准调度失败", slog.String("err", err.Error()))
 		}
 		for {
 			select {
@@ -6292,7 +6927,7 @@ Expected: PASS（18 个用例）
 				return
 			case <-ticker.C:
 				if err := reconciler.ScheduleDaily(ctx); err != nil {
-					log.Printf("每日校准调度失败: %v", err)
+					lg.Error("每日校准调度失败", slog.String("err", err.Error()))
 				}
 			}
 		}
@@ -7461,12 +8096,13 @@ Expected: PASS（3 个用例）
 			appIDs = append(appIDs, g.AppID)
 		}
 		if err := collector.EnqueueBackfill(ctx, d.Tasks, steamID, appIDs, now); err != nil {
-			log.Printf("入队成就回填失败 (steam_id=%d): %v", steamID, err)
+			d.Logger.Error("入队成就回填失败",
+				logging.SteamID(steamID), slog.String("err", err.Error()))
 		}
 	}
 ```
 
-在文件顶部补上 `"log"` 与 `"steamlink/internal/collector"` 导入。
+在文件顶部补上 `"log/slog"`、`"steamlink/internal/collector"` 与 `"steamlink/internal/logging"` 导入。
 
 - [ ] **Step 6: 实现成就查询**
 
@@ -7849,9 +8485,19 @@ func (p *Prober) advanceOne(ctx context.Context, row store.ProbeState,
 	next, events := domain.Advance(prev, domain.Probe{GameID: gameID}, now)
 
 	for _, e := range events {
-		if e.Kind != domain.SessionEnded {
+		if e.Kind == domain.SessionStarted {
+			p.lg.Info("会话开始",
+				logging.SteamID(row.SteamID),
+				slog.Uint64("appid", uint64(e.AppID)))
 			continue
 		}
+
+		p.lg.Info("会话结束，入队结算",
+			logging.SteamID(row.SteamID),
+			slog.Uint64("appid", uint64(e.AppID)),
+			slog.Time("started_at", e.StartedAt),
+			slog.Time("ended_at", e.EndedAt))
+
 		if err := p.enqueueSettle(ctx, row.SteamID, e, now); err != nil {
 			return err
 		}
@@ -8372,6 +9018,7 @@ package e2e
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -8393,7 +9040,7 @@ func e2eDB(t *testing.T) *gorm.DB {
 	if dsn == "" {
 		dsn = "root:root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
 	}
-	db, err := store.NewDB(dsn)
+	db, err := store.NewDB(dsn, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	for _, tbl := range []string{
@@ -8436,7 +9083,7 @@ func newRig(t *testing.T, start time.Time) *rig {
 
 	runner := task.NewRunner(queue, task.RunnerOptions{
 		Concurrency: 1,
-		Logf:        func(string, ...any) {},
+		// 不注入 Logger，NewRunner 会自动回退到 DiscardHandler
 	})
 	runner.Register(task.TypeSessionSettle, collector.NewSettler(collector.SettlerDeps{
 		Steam: sc, Games: games, Sessions: sessions, Tasks: queue, Now: nowFn,
@@ -8652,23 +9299,45 @@ git commit -m "test(e2e): 完整游玩时间线的端到端验证"
 - [ ] MySQL 版本 ≥ 8.0.1，`SHOW CREATE TABLE steam_links` 中可见 `GENERATED ALWAYS AS` 生成列
 - [ ] 所有表字符集为 `utf8mb4_0900_ai_ci`，含 emoji 的游戏名可正常读写
 - [ ] API 返回的 `steam_id` 为字符串类型（用 `curl` 检查实际 JSON 输出）
+- [ ] 日志中的 `steam_id` 同样是字符串（`APP_ENV=prod` 跑一次，检查 JSON 输出）
+- [ ] `grep -rn "log\.Print\|fmt\.Print\|slog\.Default" --include="*.go" .` 无输出（`cmd/*/main.go` 中配置加载失败的 stderr 直出除外）
+- [ ] `grep -rn "api_key\|state_secret" configs/` 确认全部为空值
+- [ ] 不设任何 `STEAMLINK_*` 环境变量直接启动，确认进程立即退出并提示缺失的具体变量名
+- [ ] `APP_ENV=prod` 且不设 `STEAMLINK_HTTP_BASE_URL` 时启动失败
 - [ ] 绑定一个游戏详情非公开的测试账号，确认返回 `game_details_private` 且带可操作的提示文案
 - [ ] 手动 kill 一个执行中的 worker，确认 5 分钟后任务被另一实例回收
 - [ ] 观察一天的 `steam:quota:{date}` 计数，确认稳态日调用量在 5,000 以内
 
-## 部署前的环境变量
+## 部署
+
+配置分三层，优先级从低到高：`configs/config.yaml` → `configs/config.{APP_ENV}.yaml` → `STEAMLINK_*` 环境变量。
+
+**必须注入的环境变量**（这三项在 YAML 中刻意留空，不可写入仓库）：
 
 ```bash
-MYSQL_DSN="user:pass@tcp(host:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
-REDIS_ADDR="127.0.0.1:6379"
-REDIS_PASSWORD=""
-STEAM_API_KEY="向 https://steamcommunity.com/dev/apikey 申请"
-BASE_URL="https://your-domain.com"
-HTTP_ADDR=":8080"
-STATE_SECRET="随机生成的长字符串，用于 CSRF state 签名"
+APP_ENV=prod
+STEAMLINK_STEAM_API_KEY="向 https://steamcommunity.com/dev/apikey 申请"
+STEAMLINK_MYSQL_PASSWORD="数据库密码"
+STEAMLINK_AUTH_STATE_SECRET="随机生成的长字符串，用于 CSRF state 签名"
+STEAMLINK_HTTP_BASE_URL="https://your-domain.example"
 ```
 
-`BASE_URL` 必须是 Steam 可访问的公网地址，且与 OpenID 的 `realm` 一致，否则回调验证会失败。
+**可选覆盖**（有 YAML 默认值，按需调整）：
+
+```bash
+STEAMLINK_MYSQL_HOST  STEAMLINK_MYSQL_PORT  STEAMLINK_MYSQL_DATABASE
+STEAMLINK_REDIS_ADDR  STEAMLINK_REDIS_PASSWORD
+STEAMLINK_WORKER_CONCURRENCY  STEAMLINK_LOG_LEVEL
+CONFIG_DIR   # 配置目录路径，容器中挂载到别处时使用
+```
+
+三点部署注意：
+
+- `STEAMLINK_HTTP_BASE_URL` 是站点根地址，OpenID 的 `realm` 与 `return_to` 都由它派生。它需要**用户浏览器**可达（Steam 用 302 重定向用户回来，不存在服务端回调），生产环境要求 https 的理由是 `return_to` 的 query 里带着 CSRF state，走 http 会被窃取或篡改。prod 环境下配置校验会强制检查这一点。
+- **服务在反向代理后面时，这里必须填用户看到的外部地址**（如 `https://example.com`），不能填内部地址（如 `http://10.0.0.5:8080`）——`return_to` 是给浏览器用的，填内网地址会让用户的浏览器无处可去。
+- 你的服务器需要能出网访问 `steamcommunity.com`：OpenID 第三步的 `check_authentication` 验签是由服务端主动发起的。
+- `STEAMLINK_AUTH_STATE_SECRET` 泄漏等同于允许攻击者伪造 CSRF state，把受害者的 Steam 账号绑定到攻击者的本站账号上。用密码管理器或密钥服务生成并保管，不要手写。
+- 数据库初始化执行 `scripts/db/init.sql`；后续版本的结构变更按顺序执行 `scripts/db/migrations/` 下的脚本，不要重跑 `init.sql`。
 
 
 

@@ -638,21 +638,32 @@ Steam 的 endpoint：`https://steamcommunity.com/openid/login`
 ```
 openid.ns          = http://specs.openid.net/auth/2.0
 openid.mode        = checkid_setup
-openid.return_to   = https://yourapp.com/auth/steam/callback?state=<signed>
-openid.realm       = https://yourapp.com
+openid.return_to   = {base_url}/auth/steam/callback?state=<signed>
+openid.realm       = {base_url}
 openid.identity    = http://specs.openid.net/auth/2.0/identifier_select
 openid.claimed_id  = http://specs.openid.net/auth/2.0/identifier_select
 ```
 
-**第二步 · 回调**
+`realm` 与 `return_to` 都由配置项 `http.base_url` 派生，两者存在强约束：**`return_to` 必须落在 `realm` 之下**（scheme、host、端口三者完全一致，路径在 realm 之内），否则 Steam 直接拒绝。注意端口是 realm 的组成部分，`http://localhost:8080` 与 `http://localhost` 是两个不同的 realm。
 
-Steam 重定向回 `return_to`，携带一组 `openid.*` 参数，其中：
+`identity` 与 `claimed_id` 填 `identifier_select`，意为「由用户在 Steam 侧选择身份」—— 本服务在发起时并不知道对方的 SteamID，正是要通过这次流程得知。
+
+Steam 用 **302 把用户的浏览器**重定向回 `return_to`，携带一组 `openid.*` 参数，其中：
 
 ```
 openid.claimed_id = https://steamcommunity.com/openid/id/76561198XXXXXXXXX
 ```
 
+**这一步没有任何 Steam→本服务的服务端请求。** 所谓「回调」全程是浏览器重定向，`return_to` 只需要**用户的浏览器**能访问，不要求 Steam 的服务器能访问。这有两个直接推论：
+
+- 本地开发用 `http://localhost:8080` 完全可行，不需要内网穿透
+- 服务部署在反向代理后面时，`base_url` 必须是**用户看到的外部地址**，不能是内网地址
+
+唯一需要本服务出网的是下面的第三步，方向恰好相反。
+
 **第三步 · 验证（安全生命线，不可省略）**
+
+由**本服务主动** POST 到 Steam：
 
 将收到的**全部** `openid.*` 参数原样 POST 回同一 endpoint，仅将 `openid.mode` 改为 `check_authentication`。Steam 返回：
 
@@ -669,7 +680,11 @@ is_valid:true
 var claimedIDRe = regexp.MustCompile(`^https://steamcommunity\.com/openid/id/(\d{17})$`)
 ```
 
-**CSRF 防护**：将签名过的 state 编入 `return_to` 的查询串，回调时校验。Steam 会原样回传 `return_to`，正好利用这一特性。
+**CSRF 防护**：将签名过的 state 编入 `return_to` 的查询串，回跳时校验。Steam 会原样回传 `return_to`，正好利用这一特性。
+
+这一步之所以必需，是因为 **Steam OpenID 不需要任何预先注册** —— 不像 OAuth 要在服务商后台登记 redirect_uri 白名单，Steam 接受任意 `return_to`。也就是说任何人都能构造一条指向本站回调地址的 OpenID 请求，诱导受害者点击后把攻击者的 Steam 账号绑到受害者的本站账号上（或反之）。state 校验与第三步的 `check_authentication` 缺一不可。
+
+另外，`base_url` 会作为 `realm` 显示在 Steam 的授权页面上，是用户判断「我正在授权给谁」的唯一依据，因此它必须是用户认得的正式域名。
 
 ### 7.2 绑定语义
 
