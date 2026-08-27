@@ -20,9 +20,12 @@ type HTTPClient struct {
 	apiKey  string
 	baseURL string
 	hc      *http.Client
+	limiter Limiter // 可为 nil，表示不限流（仅测试使用）
 }
 
 type Option func(*HTTPClient)
+
+func WithLimiter(l Limiter) Option { return func(c *HTTPClient) { c.limiter = l } }
 
 func WithBaseURL(u string) Option          { return func(c *HTTPClient) { c.baseURL = u } }
 func WithHTTPClient(h *http.Client) Option { return func(c *HTTPClient) { c.hc = h } }
@@ -41,6 +44,12 @@ func New(apiKey string, opts ...Option) *HTTPClient {
 
 // getJSON 发起请求并解码。HTTP 层的失败在此统一归一化。
 func (c *HTTPClient) getJSON(ctx context.Context, path string, q url.Values, out any) error {
+	if c.limiter != nil {
+		if err := c.limiter.Acquire(ctx); err != nil {
+			return err
+		}
+	}
+
 	q.Set("key", c.apiKey)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.baseURL+path+"?"+q.Encode(), nil)
@@ -56,6 +65,12 @@ func (c *HTTPClient) getJSON(ctx context.Context, path string, q url.Values, out
 
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
+		// 收到 429 说明本地限流阈值仍然过高，立即全局熔断 60 秒
+		if b, ok := c.limiter.(interface {
+			TripBreaker(context.Context, time.Duration) error
+		}); ok {
+			_ = b.TripBreaker(ctx, 60*time.Second)
+		}
 		return ErrRateLimited
 	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized:
 		// Steam 对私密资料的部分接口直接返回 401/403
