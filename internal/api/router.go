@@ -14,6 +14,7 @@ import (
 type Deps struct {
 	Links       *store.LinkRepo
 	Games       *store.GameRepo
+	Probes      *store.ProbeRepo
 	Steam       steam.Client
 	Verifier    *auth.Verifier
 	Auth        *auth.SessionStore // 登录态，勿与 Task 17 的 Sessions（游戏会话）混淆
@@ -22,7 +23,6 @@ type Deps struct {
 	SessionTTL  time.Duration
 	DevMode     bool // 仅 dev 环境为 true，用于开放本地登录端点
 	Logger      *slog.Logger
-	// Probes（*store.ProbeRepo）由 Task 11 加入；
 	// Tasks（task.Queue）与 Sessions（*store.SessionRepo）由 Task 17 加入
 }
 

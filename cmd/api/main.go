@@ -51,6 +51,7 @@ func main() {
 	r := api.NewRouter(api.Deps{
 		Links:       store.NewLinkRepo(db),
 		Games:       store.NewGameRepo(db),
+		Probes:      store.NewProbeRepo(db),
 		Steam:       sc,
 		Verifier:    auth.NewVerifier(),
 		Auth:        auth.NewSessionStore(rdb, cfg.Auth.SessionTTL),

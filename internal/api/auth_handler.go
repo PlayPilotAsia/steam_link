@@ -191,6 +191,8 @@ func (d Deps) probeAndPersist(c *gin.Context, steamID uint64) LinkStatusResponse
 	if state == store.VisibilityOK && len(games) > 0 {
 		_ = d.Games.UpsertApps(ctx, games)
 		_ = d.Games.UpsertUserGames(ctx, steamID, games, now)
+		// 初始化探针状态，让新用户立即进入采集范围
+		_ = d.Probes.Ensure(ctx, steamID, now)
 	}
 
 	slug, hint := visibilityHint(state)
