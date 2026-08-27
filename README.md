@@ -36,7 +36,7 @@ PlayPilot
 | 主存储 | MySQL 8（utf8mb4） |
 | 缓存与限流 | Redis 7 |
 | 异步任务 | 本地事务表 + 定时扫描补偿（不引入消息队列） |
-| 配置 | YAML 分环境 + viper，敏感项由环境变量注入 |
+| 配置 | YAML 分环境 + viper，实例地址与密钥由 `.env` / 环境变量注入 |
 | 日志 | 标准库 `log/slog` 结构化日志 |
 
 ## 采集架构
@@ -58,8 +58,9 @@ L0 的批量能力是成本支点：1000 个用户全量探测一轮仅需 10 �
 cmd/
   api/            Gin HTTP 服务：OpenID 登录、数据查询接口
   worker/         采集进程，可多实例水平扩展
-configs/          分环境 YAML 配置
+configs/          分环境 YAML + 各环境的 .env（后者不进仓库）
 scripts/db/       初始化 DDL 与增量迁移脚本
+scripts/dev/      本地依赖启动与测试脚本
 internal/
   config/         viper 加载与校验
   logging/        slog Logger 构造
@@ -72,17 +73,67 @@ internal/
   api/            Gin handler 与 DTO
 ```
 
-## 配置
+## 环境与配置
 
-敏感项一律不写入 YAML，由环境变量在部署时注入，缺失时启动即失败：
+三套环境，由 `APP_ENV` 选择（默认 `local`；取值写错会启动即失败，不会静默沿用基础配置）：
+
+| `APP_ENV` | 服务跑在 | 连接的 MySQL / Redis |
+|---|---|---|
+| `local` | 本机 | 本机 docker 实例 |
+| `test` | 本机 | 阿里云实例（公网 IP） |
+| `prod` | 阿里云 | 阿里云实例（内网 IP） |
+
+`configs/` 下的文件分两类：
+
+```
+configs/
+  config.yaml           基础配置，所有环境共享（会提交）
+  config.local.yaml     ┐
+  config.test.yaml      ├ 各环境的非敏感覆盖项（会提交）
+  config.prod.yaml      ┘
+  env.example           .env 模板（会提交）
+  local.env             ┐
+  test.env              ├ 实例地址与密钥（.gitignore 排除，不进仓库）
+  prod.env              ┘
+```
+
+优先级从低到高：`config.yaml` → `config.{env}.yaml` → `configs/{env}.env` → 真实环境变量。
+最后一层意味着部署时用容器环境变量可覆盖 `.env` 里的任意一项，无需先删掉文件。
+
+实例地址与密钥全部走 `.env`，YAML 中一律留空：
 
 | 配置键 | 环境变量 |
 |---|---|
 | `steam.api_key` | `STEAMLINK_STEAM_API_KEY` |
-| `mysql.password` | `STEAMLINK_MYSQL_PASSWORD` |
+| `mysql.host` / `port` / `user` / `password` | `STEAMLINK_MYSQL_HOST` / `_PORT` / `_USER` / `_PASSWORD` |
+| `redis.addr` / `password` | `STEAMLINK_REDIS_ADDR` / `STEAMLINK_REDIS_PASSWORD` |
 | `auth.state_secret` | `STEAMLINK_AUTH_STATE_SECRET` |
+| `http.base_url`（仅 prod 必填，且必须 https） | `STEAMLINK_HTTP_BASE_URL` |
 
-环境由 `APP_ENV` 选择（默认 `dev`）。
+其中 `steam.api_key`、`mysql.password`、`auth.state_secret` 为必填，缺失时启动即失败并指明缺哪一项 —— 而不是等到第一次调用 Steam 才暴露。
+
+新环境从模板起步：
+
+```bash
+cp configs/env.example configs/test.env   # 然后填入实例地址与密钥
+```
+
+> 连阿里云（`test`）时记得把本机出口 IP 加进 RDS / Redis 的白名单，否则连接会超时。
+
+## 本地开发
+
+```bash
+./scripts/dev/up.sh    # 起依赖并应用 scripts/db/init.sql（可重复执行）
+./scripts/dev/test.sh  # go vet + 全量测试（集成测试需要 MySQL 与 Redis 就绪）
+
+go run ./cmd/api       # HTTP 服务
+go run ./cmd/worker    # 采集进程
+```
+
+`up.sh` 默认复用本机常驻的 `dev-mysql` / `dev-redis` 容器；找不到时回退到本仓库的 `docker-compose.yml`。
+集成测试打的是真实 MySQL —— `SKIP LOCKED`、生成列、`ON DUPLICATE KEY UPDATE` 的行为在 SQLite 上完全不同，用它测等于没测。测试库地址可用 `TEST_MYSQL_DSN` 覆盖。
+
+要求 **Go 1.24+**、**MySQL 8.0.1+**（低于此版本 `SELECT ... FOR UPDATE SKIP LOCKED` 不可用，整个任务表方案失效）。
 
 ## 已知约束
 
@@ -93,4 +144,4 @@ internal/
 ## 文档
 
 - [设计文档](docs/01-design.md) — 平台约束、数据模型、采集管线、可靠性设计
-- [实施文档](docs/02-implementation.md) — 分阶段落地细节
+- [实施文档](docs/02-implementation.md) — 分阶段落地细节（已实施完毕，冻结为历史留痕，不再随代码更新）
