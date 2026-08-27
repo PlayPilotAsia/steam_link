@@ -8,12 +8,12 @@ import (
 	"syscall"
 	"time"
 
-	"steamlink/internal/collector"
-	"steamlink/internal/config"
-	"steamlink/internal/logging"
-	"steamlink/internal/steam"
-	"steamlink/internal/store"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/collector"
+	"github.com/PlayPilotAsia/steam_link/internal/config"
+	"github.com/PlayPilotAsia/steam_link/internal/logging"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 func configDir() string {

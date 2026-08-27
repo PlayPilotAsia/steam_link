@@ -1,4 +1,4 @@
-module steamlink
+module github.com/PlayPilotAsia/steam_link
 
 go 1.24.0
 

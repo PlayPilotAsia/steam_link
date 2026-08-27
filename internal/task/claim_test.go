@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 // 领取后任务转为执行中，且 next_run_at 被推到租约到期时刻 ——

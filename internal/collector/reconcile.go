@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"steamlink/internal/steam"
-	"steamlink/internal/store"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 // PrivateStrikeLimit（连续探测到私密后停止重试的阈值）定义在 enqueue.go，

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 // BackfillSpread 是全库回填任务铺开的时间窗。

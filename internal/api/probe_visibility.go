@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"steamlink/internal/steam"
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 // ErrSteamAccountNotFound 表示该 SteamID 在 Steam 侧不存在。

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"steamlink/internal/steam"
-	"steamlink/internal/store"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 // PrivateStrikeLimit 是连续探测到非公开多少次后放弃该用户（设计文档 §8.3）。

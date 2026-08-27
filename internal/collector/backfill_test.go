@@ -7,8 +7,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"steamlink/internal/store"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 // 回填任务必须用最低优先级 —— 一个新用户会一次性产生数百条任务，

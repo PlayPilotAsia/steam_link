@@ -7,7 +7,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 // MaxAttempts 是转入死信前的最大重试次数。

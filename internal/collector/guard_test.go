@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"steamlink/internal/steam"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 type fixedGuard struct{ level DegradeLevel }

@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 func TestRunner_DispatchesByType(t *testing.T) {

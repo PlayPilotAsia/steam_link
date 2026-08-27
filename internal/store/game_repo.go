@@ -8,7 +8,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"steamlink/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
 )
 
 // upsertBatchSize 控制单条 INSERT 的行数。一个用户的游戏库可达数千款，

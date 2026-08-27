@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"time"
 
-	"steamlink/internal/domain"
-	"steamlink/internal/logging"
-	"steamlink/internal/steam"
-	"steamlink/internal/store"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/domain"
+	"github.com/PlayPilotAsia/steam_link/internal/logging"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 // SettleDelay 是会话结束到查询时长之间的等待时间。

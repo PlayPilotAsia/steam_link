@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"steamlink/internal/domain"
-	"steamlink/internal/store"
-	"steamlink/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/domain"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/task"
 )
 
 // StaleThreshold 是判定探针状态为「僵尸」的阈值。

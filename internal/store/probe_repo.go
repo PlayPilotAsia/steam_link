@@ -7,7 +7,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"steamlink/internal/domain"
+	"github.com/PlayPilotAsia/steam_link/internal/domain"
 )
 
 type ProbeRepo struct{ db *gorm.DB }

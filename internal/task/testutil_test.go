@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }

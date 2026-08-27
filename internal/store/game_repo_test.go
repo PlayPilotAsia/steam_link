@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
 	"github.com/stretchr/testify/require"
-	"steamlink/internal/steam"
 )
 
 func sampleGames() []steam.OwnedGame {

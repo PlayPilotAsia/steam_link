@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"steamlink/internal/logging"
+	"github.com/PlayPilotAsia/steam_link/internal/logging"
 )
 
 // ErrPermanent 标记不可恢复的失败。handler 用 %w 包装它返回时，

@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"steamlink/internal/steam"
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/steam"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 // fakeSteam 让我们精确构造三种隐私状态。

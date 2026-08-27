@@ -10,10 +10,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"steamlink/internal/auth"
-	"steamlink/internal/collector"
-	"steamlink/internal/logging"
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/auth"
+	"github.com/PlayPilotAsia/steam_link/internal/collector"
+	"github.com/PlayPilotAsia/steam_link/internal/logging"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 // SessionCookieName 是承载本站登录态的 Cookie 名。

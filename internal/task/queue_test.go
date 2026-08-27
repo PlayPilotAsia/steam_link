@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
-	"steamlink/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
 // fixedClock 让任务表的时间行为完全可控。

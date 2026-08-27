@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"steamlink/internal/domain"
+	"github.com/PlayPilotAsia/steam_link/internal/domain"
 )
 
 func TestProbeRepo_EnsureAndDue(t *testing.T) {
