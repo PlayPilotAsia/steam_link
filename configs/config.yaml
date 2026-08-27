@@ -1,0 +1,47 @@
+# 敏感项一律留空，由 STEAMLINK_* 环境变量注入。
+# 本文件会提交到仓库，任何写在这里的密钥都等同于公开。
+app:
+  env: dev
+
+http:
+  addr: ":8080"
+  # 站点根地址，派生出 OpenID 的两个参数：
+  #   openid.realm     = {base_url}
+  #   openid.return_to = {base_url}/auth/steam/callback?state=...
+  # Steam 会校验 return_to 落在 realm 之下（同 scheme/host/port）。
+  #
+  # 它需要「用户的浏览器」能访问，而非「Steam 的服务器」能访问 ——
+  # Steam 是用 302 把用户浏览器重定向回来的，不存在服务端回调。
+  # 因此本地开发用 localhost 完全可行，无需内网穿透。
+  base_url: "http://localhost:8080"
+
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: ""          # ← STEAMLINK_MYSQL_PASSWORD
+  database: "steamlink"
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+steam:
+  api_key: ""           # ← STEAMLINK_STEAM_API_KEY
+  # 令牌桶参数。社区实测持续 1 req/s 绝对安全，突发 10+ 会触发 429，
+  # 5 req/s 是留了余量的取值。
+  rate_per_sec: 5
+  burst: 20
+
+auth:
+  state_secret: ""      # ← STEAMLINK_AUTH_STATE_SECRET
+  session_ttl: 24h
+
+worker:
+  concurrency: 4
+  poll_interval: 2s
+
+log:
+  level: info
+  format: json

@@ -1072,8 +1072,17 @@ var (
 	// 并将任务置为成功 —— 这不是失败。
 	ErrAppHasNoStats = errors.New("steam: app has no achievement stats")
 
-	// ErrRateLimited 表示触发了 Steam 的速率限制，上层应全局退避。
-	ErrRateLimited = errors.New("steam: rate limited")
+	// ErrRateLimited 表示 Steam 返回了 429，即真实触发了平台侧的速率限制。
+	// 上层应全局退避。
+	ErrRateLimited = errors.New("steam: rate limited by steam")
+
+	// ErrThrottled 表示请求被本地令牌桶拦下，还没有发出去。
+	//
+	// 必须与 ErrRateLimited 分开：前者是「我们自己主动节流」，属于正常的
+	// 流控行为，任务应当推迟而非计为失败；后者是「Steam 真的拒绝了我们」，
+	// 需要触发全局熔断。二者混用会让回填高峰期的任务因反复被本地限流
+	// 累加 attempts，最终无谓地进入死信。
+	ErrThrottled = errors.New("steam: throttled by local rate limiter")
 )
 
 // classifyPlayerStatsError 把 playerstats.error 的文案映射到哨兵错误。
@@ -1453,7 +1462,11 @@ func TestRedisLimiter_BurstThenReject(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		require.NoError(t, l.Acquire(ctx), "前 3 次应放行（burst）")
 	}
-	require.ErrorIs(t, l.Acquire(ctx), ErrRateLimited, "第 4 次应被限流")
+
+	err := l.Acquire(ctx)
+	require.ErrorIs(t, err, ErrThrottled, "第 4 次应被本地令牌桶拦下")
+	require.NotErrorIs(t, err, ErrRateLimited,
+		"本地节流不得与 Steam 返回 429 混为一谈：前者应推迟任务，后者要触发熔断")
 }
 
 // 令牌按速率回填。
@@ -1462,7 +1475,7 @@ func TestRedisLimiter_Refills(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, l.Acquire(ctx))
-	require.ErrorIs(t, l.Acquire(ctx), ErrRateLimited)
+	require.ErrorIs(t, l.Acquire(ctx), ErrThrottled)
 
 	time.Sleep(150 * time.Millisecond) // 10 req/s 下 100ms 回填 1 个
 	require.NoError(t, l.Acquire(ctx), "回填后应放行")
@@ -1613,7 +1626,8 @@ func (l *RedisLimiter) Acquire(ctx context.Context) error {
 		return err
 	}
 	if allowed == 0 {
-		return ErrRateLimited
+		// 本地节流，请求还没发出去 —— 与 Steam 返回 429 是两回事
+		return ErrThrottled
 	}
 
 	// 4. 计入配额。放行后才计数，保证与实际调用数一致。
@@ -2016,6 +2030,7 @@ git commit -m "feat(auth): OpenID 2.0 验证与 claimed_id 严格校验"
     - `BumpPrivateStrikes(ctx, steamID uint64) (int8, error)`
     - `ResetPrivateStrikes(ctx, steamID uint64) error`
     - `ActiveSteamIDs(ctx) ([]uint64, error)`
+    - `StaleSteamIDs(ctx, before time.Time) ([]uint64, error)` — 距上次校准超过阈值的活跃用户，供每日调度过滤
   - `store.NewGameRepo(db *gorm.DB) *GameRepo`，方法：
     - `UpsertApps(ctx, games []steam.OwnedGame) error`
     - `UpsertUserGames(ctx, steamID uint64, games []steam.OwnedGame, now time.Time) error`
@@ -2453,6 +2468,20 @@ func (r *LinkRepo) ActiveSteamIDs(ctx context.Context) ([]uint64, error) {
 	return ids, err
 }
 
+// StaleSteamIDs 返回距上次成功校准已超过阈值的活跃用户。
+//
+// 每日校准据此过滤，避免 worker 每次重启都把全量用户重新排进队列。
+// last_verified_at 为 NULL 表示从未校准过（刚绑定），一律纳入。
+func (r *LinkRepo) StaleSteamIDs(ctx context.Context, before time.Time) ([]uint64, error) {
+	var ids []uint64
+	err := r.db.WithContext(ctx).Model(&SteamLink{}).
+		Where("unlinked_at IS NULL").
+		Where("last_verified_at IS NULL OR last_verified_at < ?", before).
+		Order("steam_id64").
+		Pluck("steam_id64", &ids).Error
+	return ids, err
+}
+
 // isDuplicateKey 识别 MySQL 的 1062 错误码。
 func isDuplicateKey(err error) bool {
 	var me *mysql.MySQLError
@@ -2691,7 +2720,6 @@ func (r *GameRepo) PlaytimeMap(ctx context.Context, steamID uint64) (map[uint32]
 	return m, nil
 }
 
-var _ = gorm.ErrRecordNotFound // 保持 gorm 导入
 ```
 
 - [ ] **Step 10: 运行全部仓储测试**
@@ -3114,35 +3142,75 @@ package api
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"steamlink/internal/auth"
+	"steamlink/internal/logging"
 	"steamlink/internal/store"
 )
 
-// currentUserID 从登录会话解析本站用户。
-// 本项目假设已有账号体系，此处以 Bearer token 为例。
+// SessionCookieName 是承载本站登录态的 Cookie 名。
+//
+// 必须用 Cookie 而非 Authorization 头：OpenID 流程包含两次浏览器顶层导航
+//（本站 → Steam、Steam → 本站），顶层导航无法携带自定义请求头，
+// 用 fetch 又会撞上跨域重定向。Cookie 是唯一能贯穿整个流程的载体。
+const SessionCookieName = "steamlink_session"
+
+// setSessionCookie 写入登录态 Cookie。
+//
+// SameSite 必须是 Lax 而非 Strict：Steam 回跳是一次跨站顶层 GET 导航，
+// Strict 会拒绝携带 Cookie，导致回调时读不到用户身份、绑定必然失败。
+// Lax 恰好允许跨站顶层 GET 携带 Cookie，同时仍能挡住跨站 POST 的 CSRF。
+func (d Deps) setSessionCookie(c *gin.Context, token string, ttl time.Duration) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(ttl.Seconds()),
+		HttpOnly: true,
+		Secure:   strings.HasPrefix(d.BaseURL, "https://"),
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// currentUserID 从 Cookie 解析本站用户。
+//
+// 本项目假设已有账号体系：该体系在用户登录时调用 auth.SessionStore.Issue
+// 签发 token 并通过 setSessionCookie 下发，本项目只负责消费。
 func (d Deps) currentUserID(c *gin.Context) (uint64, bool) {
-	tok := c.GetHeader("Authorization")
-	if len(tok) > 7 && tok[:7] == "Bearer " {
-		tok = tok[7:]
+	tok, err := c.Cookie(SessionCookieName)
+	if err != nil || tok == "" {
+		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "请先登录"})
+		return 0, false
 	}
+
 	id, err := d.Auth.Resolve(c.Request.Context(), tok)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "请先登录"})
+		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "登录已过期，请重新登录"})
 		return 0, false
 	}
 	return id, true
 }
 
 // handleLogin 发起 OpenID 跳转。
+//
+// 这是一个浏览器顶层导航入口（前端用 window.location 跳转过来），
+// 因此失败时也必须重定向而非返回 JSON —— 用户看到的是页面，不是接口响应。
 func (d Deps) handleLogin(c *gin.Context) {
-	userID, ok := d.currentUserID(c)
-	if !ok {
+	tok, err := c.Cookie(SessionCookieName)
+	if err != nil || tok == "" {
+		d.redirectResult(c, "unauthorized")
+		return
+	}
+	userID, err := d.Auth.Resolve(c.Request.Context(), tok)
+	if err != nil {
+		d.redirectResult(c, "unauthorized")
 		return
 	}
 
@@ -3153,35 +3221,48 @@ func (d Deps) handleLogin(c *gin.Context) {
 }
 
 // handleCallback 处理 Steam 回跳：验证断言 → 校验 state → 建立绑定 → 探测隐私。
+//
+// 全程以 302 回应：这个端点是被用户浏览器直接导航到的，返回 JSON
+// 会让用户对着一屏原始 JSON 发呆。结果通过 query 参数传给前端页面。
 func (d Deps) handleCallback(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	userID, err := auth.VerifyState(d.StateSecret, c.Query("state"), time.Now().UTC())
 	if err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Code: "invalid_state", Message: "登录请求已过期，请重试"})
+		d.redirectResult(c, "invalid_state")
 		return
 	}
 
 	// 安全生命线：必须向 Steam 确认这次断言，见设计文档 §7.1
 	steamID, err := d.Verifier.Verify(ctx, c.Request.URL.Query())
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "openid_invalid", Message: "Steam 验证失败"})
+		d.Logger.Warn("OpenID 断言验证失败", slog.String("err", err.Error()))
+		d.redirectResult(c, "openid_invalid")
 		return
 	}
 
 	switch err := d.Links.Link(ctx, userID, steamID); {
 	case errors.Is(err, store.ErrSteamIDTaken):
-		c.JSON(http.StatusConflict, ErrorResponse{Code: "steam_id_taken", Message: "该 Steam 账号已被其他用户绑定"})
+		d.redirectResult(c, "steam_id_taken")
 		return
 	case errors.Is(err, store.ErrAlreadyLinked):
-		c.JSON(http.StatusConflict, ErrorResponse{Code: "already_linked", Message: "请先解绑当前 Steam 账号"})
+		d.redirectResult(c, "already_linked")
 		return
 	case err != nil:
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "绑定失败"})
+		d.Logger.Error("建立绑定失败",
+			logging.SteamID(steamID), slog.String("err", err.Error()))
+		d.redirectResult(c, "internal_error")
 		return
 	}
 
-	c.JSON(http.StatusOK, d.probeAndPersist(c, steamID))
+	status := d.probeAndPersist(c, steamID)
+	d.redirectResult(c, status.Visibility)
+}
+
+// redirectResult 把结果作为 query 参数带回前端的绑定结果页。
+func (d Deps) redirectResult(c *gin.Context, status string) {
+	c.Redirect(http.StatusFound,
+		d.BaseURL+"/settings/steam?status="+url.QueryEscape(status))
 }
 
 // handleRecheck 供「我已修改隐私设置，重新检测」按钮调用。
@@ -3198,6 +3279,27 @@ func (d Deps) handleRecheck(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, d.probeAndPersist(c, link.SteamID))
+}
+
+// handleDevLogin 仅在 dev 环境注册，直接为指定 user_id 签发登录态。
+// 生产环境由既有账号体系承担同样的职责（调用 Issue + setSessionCookie）。
+func (d Deps) handleDevLogin(c *gin.Context) {
+	var req struct {
+		UserID uint64 `json:"user_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.UserID == 0 {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Code: "bad_request", Message: "缺少 user_id"})
+		return
+	}
+
+	tok, err := d.Auth.Issue(c.Request.Context(), req.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "签发失败"})
+		return
+	}
+
+	d.setSessionCookie(c, tok, d.SessionTTL)
+	c.JSON(http.StatusOK, gin.H{"user_id": req.UserID})
 }
 
 func (d Deps) handleUnlink(c *gin.Context) {
@@ -3254,19 +3356,21 @@ import (
 	"steamlink/internal/auth"
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
-	"steamlink/internal/task"
 )
 
 type Deps struct {
 	Links       *store.LinkRepo
 	Games       *store.GameRepo
+	Probes      *store.ProbeRepo
 	Steam       steam.Client
 	Verifier    *auth.Verifier
 	Auth        *auth.SessionStore // 登录态，勿与 Task 17 的 Sessions（游戏会话）混淆
-	Tasks       task.Queue
 	BaseURL     string
 	StateSecret []byte
+	SessionTTL  time.Duration
+	DevMode     bool // 仅 dev 环境为 true，用于开放本地登录端点
 	Logger      *slog.Logger
+	// Tasks（task.Queue）与 Sessions（*store.SessionRepo）由 Task 17 加入
 }
 
 func NewRouter(d Deps) *gin.Engine {
@@ -3283,6 +3387,13 @@ func NewRouter(d Deps) *gin.Engine {
 	r.GET("/auth/steam/login", d.handleLogin)
 	r.GET("/auth/steam/callback", d.handleCallback)
 
+	// 本站登录态由既有账号体系签发：它在用户登录时调用
+	// auth.SessionStore.Issue 拿到 token，再用 d.setSessionCookie 下发。
+	// 开发环境提供一个直接签发的端点，便于本地跑通整条绑定流程。
+	if d.DevMode {
+		r.POST("/dev/login", d.handleDevLogin)
+	}
+
 	api := r.Group("/api")
 	{
 		api.POST("/link/recheck", d.handleRecheck)
@@ -3292,7 +3403,7 @@ func NewRouter(d Deps) *gin.Engine {
 }
 ```
 
-> `task.Queue` 尚未定义，本步骤会编译失败。这是预期的 —— 先注释掉 `Deps.Tasks` 字段与 `task` 导入，在 Task 8 完成后取消注释。
+> 上面的 `Deps` **不含** `Tasks` 字段，`router.go` 也不导入 `internal/task` —— 该包在 Task 8 才存在。成就回填需要它，因此由 Task 17 在需要时一次性加入。本任务写完即可编译通过，无需任何「先注释掉、之后再解开」的操作。
 
 - [ ] **Step 10: 写 API 入口**
 
@@ -3352,11 +3463,14 @@ func main() {
 	r := api.NewRouter(api.Deps{
 		Links:       store.NewLinkRepo(db),
 		Games:       store.NewGameRepo(db),
+		Probes:      store.NewProbeRepo(db),
 		Steam:       sc,
 		Verifier:    auth.NewVerifier(),
 		Auth:        auth.NewSessionStore(rdb, cfg.Auth.SessionTTL),
 		BaseURL:     cfg.HTTP.BaseURL,
 		StateSecret: []byte(cfg.Auth.StateSecret),
+		SessionTTL:  cfg.Auth.SessionTTL,
+		DevMode:     cfg.App.Env == "dev",
 		Logger:      lg,
 	})
 
@@ -3490,6 +3604,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 )
@@ -3553,8 +3668,6 @@ func itoa(v uint32) string {
 }
 ```
 
-在文件顶部补上 `"strconv"` 导入。
-
 在 `internal/api/router.go` 的 `api` 分组中注册路由：
 
 ```go
@@ -3598,9 +3711,10 @@ git commit -m "feat(api): 游戏库查询接口"
   - 状态常量：`task.StatusPending = 0`、`task.StatusRunning = 1`、`task.StatusSucceeded = 2`、`task.StatusRetrying = 3`、`task.StatusDead = 4`
   - 优先级常量：`task.PriorityRealtime = 1`、`task.PriorityNormal = 5`、`task.PriorityBackfill = 9`
   - `task.Task` 结构体（字段同 `store.SyncTask`）
-  - `task.Queue` 接口，四个方法见下
-  - `task.NewMySQLQueue(db *gorm.DB) *MySQLQueue`
-  - `task.SessionPayload` 结构体：`StartedAt time.Time`、`EndedAt time.Time`
+  - `task.Queue` 接口，五个方法见下
+  - `task.NewMySQLQueue(db *gorm.DB, opts ...QueueOption) *MySQLQueue`
+  - `task.WithClock(fn func() time.Time) QueueOption` — 注入时钟，端到端测试必需
+  - `task.SessionPayload` 结构体：`StartedAt time.Time`、`EndedAt time.Time`、`Source int8`
 
 - [ ] **Step 1: 定义类型与接口**
 
@@ -3654,9 +3768,14 @@ type Task struct {
 }
 
 // SessionPayload 是 TypeSessionSettle 任务携带的数据。
+//
+// Source 决定落库会话的可信度标记：探针捕获的传 store.SourceProbe，
+// 启动自愈补结的传 store.SourceReconcile —— 后者跨越了 worker 宕机窗口，
+// 起止时刻不可信，不得冒充实测数据（设计文档 §3.2、§9.4）。
 type SessionPayload struct {
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
+	Source    int8      `json:"source"`
 }
 
 type Queue interface {
@@ -3668,6 +3787,12 @@ type Queue interface {
 	Succeed(ctx context.Context, id uint64) error
 	// Fail 记录失败并按指数退避重排，超过上限后转入死信。
 	Fail(ctx context.Context, id uint64, cause error) error
+	// Defer 推迟任务但**不累加 attempts**。
+	//
+	// 用于限流、熔断、配额降级这类「现在不能做，但不是失败」的场景。
+	// 若这些场景走 Fail，配额耗尽期间的任务会因反复累加 attempts 被推入死信 ——
+	// 而次日配额重置后它们本该正常执行。
+	Defer(ctx context.Context, id uint64, until time.Time, reason string) error
 }
 ```
 
@@ -3704,7 +3829,9 @@ func testDB(t *testing.T) *gorm.DB {
 }
 ```
 
-创建 `internal/task/queue_test.go`：
+创建 `internal/task/queue_test.go`。
+
+> 本文件**不得引用 `Claim`** —— 它在 Task 9 才实现。Go 的 `-run` 过滤发生在编译之后，只要文件里出现一处未定义的方法，整个测试包就无法构建，一个用例都跑不了，本任务也就无法满足「测试全绿才能提交」的约束。所有需要 `Claim` 的验证都放在 Task 9 的 `claim_test.go`。
 
 ```go
 package task
@@ -3720,31 +3847,49 @@ import (
 	"steamlink/internal/store"
 )
 
+// fixedClock 让任务表的时间行为完全可控。
+func fixedClock(t time.Time) QueueOption {
+	return WithClock(func() time.Time { return t })
+}
+
+// takeOnly 取出表中唯一一行，断言确实只有一行。
+func takeOnly(t *testing.T, db *gorm.DB) store.SyncTask {
+	t.Helper()
+	var rows []store.SyncTask
+	require.NoError(t, db.Find(&rows).Error)
+	require.Len(t, rows, 1)
+	return rows[0]
+}
+
 func TestEnqueue_Insert(t *testing.T) {
-	q := NewMySQLQueue(testDB(t))
+	db := testDB(t)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
 	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeAchievementSync, SteamID: 76561197960287930, AppID: 620,
-		Priority: PriorityNormal, NextRunAt: time.Now().UTC(),
+		Priority: PriorityNormal, NextRunAt: now,
 	}))
 
-	got, err := q.Claim(ctx, 10, time.Minute)
-	require.NoError(t, err)
-	require.Len(t, got, 1)
-	require.Equal(t, uint32(620), got[0].AppID)
+	row := takeOnly(t, db)
+	require.Equal(t, TypeAchievementSync, row.Type)
+	require.Equal(t, uint32(620), row.AppID)
+	require.Equal(t, StatusPending, row.Status)
+	require.Equal(t, now.Unix(), row.NextRunAt.Unix())
 }
 
 // 唯一键保证同一任务标识只有一行，重复入队不会堆积。
 func TestEnqueue_IdempotentOnUniqueKey(t *testing.T) {
 	db := testDB(t)
-	q := NewMySQLQueue(db)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
 		require.NoError(t, q.Enqueue(ctx, Task{
 			Type: TypeAchievementSync, SteamID: 76561197960287930, AppID: 620,
-			Priority: PriorityNormal, NextRunAt: time.Now().UTC(),
+			Priority: PriorityNormal, NextRunAt: now,
 		}))
 	}
 
@@ -3756,9 +3901,9 @@ func TestEnqueue_IdempotentOnUniqueKey(t *testing.T) {
 // 重复入队时取更早的执行时刻 —— 新的紧急需求不应被旧的远期排期压住。
 func TestEnqueue_TakesEarlierNextRunAt(t *testing.T) {
 	db := testDB(t)
-	q := NewMySQLQueue(db)
-	ctx := context.Background()
 	base := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(base))
+	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
@@ -3769,104 +3914,139 @@ func TestEnqueue_TakesEarlierNextRunAt(t *testing.T) {
 		NextRunAt: base.Add(time.Minute),
 	}))
 
-	var row store.SyncTask
-	require.NoError(t, db.Take(&row).Error)
-	require.Equal(t, base.Add(time.Minute).Unix(), row.NextRunAt.Unix())
+	require.Equal(t, base.Add(time.Minute).Unix(), takeOnly(t, db).NextRunAt.Unix())
+}
+
+// 反向：已排期在前的任务，不会被更晚的入队推后。
+func TestEnqueue_DoesNotPushBackEarlierSchedule(t *testing.T) {
+	db := testDB(t)
+	base := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(base))
+	ctx := context.Background()
+
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
+		NextRunAt: base.Add(time.Minute),
+	}))
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
+		NextRunAt: base.Add(6 * time.Hour),
+	}))
+
+	require.Equal(t, base.Add(time.Minute).Unix(), takeOnly(t, db).NextRunAt.Unix())
 }
 
 // 已成功的任务再次入队应复活为待执行 —— 这是「状态表而非日志表」的关键行为。
 func TestEnqueue_RevivesSucceededTask(t *testing.T) {
 	db := testDB(t)
-	q := NewMySQLQueue(db)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
 	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeAchievementSync, SteamID: 1, AppID: 620,
-		Priority: PriorityNormal, NextRunAt: time.Now().UTC(),
+		Priority: PriorityNormal, NextRunAt: now,
 	}))
-	claimed, err := q.Claim(ctx, 10, time.Minute)
-	require.NoError(t, err)
-	require.NoError(t, q.Succeed(ctx, claimed[0].ID))
+
+	// 直接改库模拟「已执行成功且累计过失败次数」，不依赖 Claim
+	id := takeOnly(t, db).ID
+	require.NoError(t, db.Model(&store.SyncTask{}).Where("id = ?", id).
+		Updates(map[string]any{"status": StatusSucceeded, "attempts": 3}).Error)
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeAchievementSync, SteamID: 1, AppID: 620,
-		Priority: PriorityNormal, NextRunAt: time.Now().UTC().Add(-time.Second),
+		Priority: PriorityNormal, NextRunAt: now.Add(time.Hour),
 	}))
 
-	again, err := q.Claim(ctx, 10, time.Minute)
-	require.NoError(t, err)
-	require.Len(t, again, 1, "已成功的任务再次入队应可被重新领取")
-	require.Equal(t, uint16(0), again[0].Attempts, "重试次数应清零")
+	row := takeOnly(t, db)
+	require.Equal(t, StatusPending, row.Status, "已成功的任务应复活为待执行")
+	require.Equal(t, uint16(0), row.Attempts, "重试次数应清零")
 }
 
-// 未到期的任务不应被领取。
-func TestClaim_SkipsFutureTasks(t *testing.T) {
-	q := NewMySQLQueue(testDB(t))
-	ctx := context.Background()
-
-	require.NoError(t, q.Enqueue(ctx, Task{
-		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
-		NextRunAt: time.Now().UTC().Add(time.Hour),
-	}))
-
-	got, err := q.Claim(ctx, 10, time.Minute)
-	require.NoError(t, err)
-	require.Empty(t, got)
-}
-
-// 优先级必须先于时间生效：回填任务不能插队到实时任务前面。
-func TestClaim_PriorityBeatsTime(t *testing.T) {
-	q := NewMySQLQueue(testDB(t))
-	ctx := context.Background()
-	past := time.Now().UTC().Add(-time.Hour)
-
-	// 回填任务更早入队
-	require.NoError(t, q.Enqueue(ctx, Task{
-		Type: TypeAchievementSync, SteamID: 1, AppID: 620,
-		Priority: PriorityBackfill, NextRunAt: past.Add(-time.Hour),
-	}))
-	// 实时任务更晚，但优先级更高
-	require.NoError(t, q.Enqueue(ctx, Task{
-		Type: TypeSessionSettle, SteamID: 1, AppID: 730,
-		Priority: PriorityRealtime, NextRunAt: past,
-	}))
-
-	got, err := q.Claim(ctx, 1, time.Minute)
-	require.NoError(t, err)
-	require.Len(t, got, 1)
-	require.Equal(t, TypeSessionSettle, got[0].Type, "实时任务必须优先")
-}
-
-func TestFail_BackoffThenDead(t *testing.T) {
+func TestFail_SchedulesBackoff(t *testing.T) {
 	db := testDB(t)
-	q := NewMySQLQueue(db)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
 	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
-		NextRunAt: time.Now().UTC().Add(-time.Second),
+		NextRunAt: now,
 	}))
-	claimed, err := q.Claim(ctx, 1, time.Minute)
-	require.NoError(t, err)
+	id := takeOnly(t, db).ID
 
-	require.NoError(t, q.Fail(ctx, claimed[0].ID, errors.New("boom")))
+	require.NoError(t, q.Fail(ctx, id, errors.New("boom")))
 
-	var row store.SyncTask
-	require.NoError(t, db.Take(&row).Error)
+	row := takeOnly(t, db)
 	require.Equal(t, StatusRetrying, row.Status)
 	require.Equal(t, uint16(1), row.Attempts)
 	require.Contains(t, row.LastError, "boom")
-	require.True(t, row.NextRunAt.After(time.Now().UTC()), "应退避到未来")
+	require.Equal(t, now.Add(30*time.Second).Unix(), row.NextRunAt.Unix(),
+		"首次失败退避 30 秒")
+}
 
-	// 连续失败超过上限转入死信
-	require.NoError(t, db.Model(&store.SyncTask{}).
-		Where("id = ?", row.ID).Update("attempts", MaxAttempts).Error)
-	require.NoError(t, q.Fail(ctx, row.ID, errors.New("boom again")))
+// 达到上限后转入死信并告警。
+func TestFail_TransitionsToDead(t *testing.T) {
+	db := testDB(t)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
+	ctx := context.Background()
 
-	require.NoError(t, db.Take(&row).Error)
-	require.Equal(t, StatusDead, row.Status)
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
+		NextRunAt: now,
+	}))
+	id := takeOnly(t, db).ID
+
+	require.NoError(t, db.Model(&store.SyncTask{}).Where("id = ?", id).
+		Update("attempts", MaxAttempts-1).Error)
+	require.NoError(t, q.Fail(ctx, id, errors.New("boom again")))
+
+	require.Equal(t, StatusDead, takeOnly(t, db).Status)
+}
+
+// 退避序列必须在 6 小时封顶，且该分支真实可达 ——
+// 否则「上限 6h」只是一句写在文档里的死代码。
+func TestBackoff_CapsAtSixHours(t *testing.T) {
+	require.Equal(t, 30*time.Second, backoff(1))
+	require.Equal(t, time.Minute, backoff(2))
+	require.Equal(t, 32*time.Minute, backoff(7))
+	require.Equal(t, 4*time.Hour+16*time.Minute, backoff(10))
+	require.Equal(t, 6*time.Hour, backoff(11), "超过 6 小时必须封顶")
+
+	require.Less(t, backoff(MaxAttempts-1), 7*time.Hour)
+	require.Equal(t, 6*time.Hour, backoff(MaxAttempts-1),
+		"MaxAttempts 必须大到让 6 小时上限真实生效")
+}
+
+// Defer 推迟任务但不累加 attempts —— 限流与配额降级不是失败。
+func TestDefer_DoesNotCountAsAttempt(t *testing.T) {
+	db := testDB(t)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
+	ctx := context.Background()
+
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeAchievementSync, SteamID: 1, AppID: 620,
+		Priority: PriorityBackfill, NextRunAt: now,
+	}))
+	id := takeOnly(t, db).ID
+
+	for i := 0; i < 20; i++ {
+		require.NoError(t, q.Defer(ctx, id, now.Add(time.Hour), "配额紧张"))
+	}
+
+	row := takeOnly(t, db)
+	require.Equal(t, uint16(0), row.Attempts,
+		"反复推迟不得累加重试次数，否则配额耗尽期间任务会被推入死信")
+	require.NotEqual(t, StatusDead, row.Status)
+	require.Equal(t, StatusPending, row.Status)
+	require.Equal(t, now.Add(time.Hour).Unix(), row.NextRunAt.Unix())
+	require.Contains(t, row.LastError, "配额紧张")
 }
 ```
+
+在文件顶部的导入中补上 `"gorm.io/gorm"`（`takeOnly` 需要）。
 
 - [ ] **Step 3: 运行测试确认失败**
 
@@ -3882,8 +4062,6 @@ package task
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -3893,7 +4071,15 @@ import (
 )
 
 // MaxAttempts 是转入死信前的最大重试次数。
-const MaxAttempts = 8
+//
+// 取 12 而非更小的值，是为了让退避真正走到 6 小时上限：
+// 序列为 30s、1m、2m、4m、8m、16m、32m、1h4m、2h8m、4h16m、6h，
+// 累计重试窗口约 14 小时。Steam 侧的故障可能持续数小时，
+// 一小时就放弃会让大量任务无谓地进入死信。
+const MaxAttempts = 12
+
+// MaxBackoff 是单次退避的上限。
+const MaxBackoff = 6 * time.Hour
 
 // LeaseDuration 是默认租约时长。worker 崩溃后，任务在此时长后被自动回收。
 const LeaseDuration = 5 * time.Minute
@@ -3903,8 +4089,21 @@ type MySQLQueue struct {
 	nowFunc func() time.Time
 }
 
-func NewMySQLQueue(db *gorm.DB) *MySQLQueue {
-	return &MySQLQueue{db: db, nowFunc: func() time.Time { return time.Now().UTC() }}
+type QueueOption func(*MySQLQueue)
+
+// WithClock 注入时钟。端到端测试需要用假时钟回放时间线，
+// 若队列固定使用 time.Now，Claim 会用真实墙钟比对假时钟写入的
+// next_run_at，导致延迟执行类的断言变成时间炸弹式的 flaky test。
+func WithClock(fn func() time.Time) QueueOption {
+	return func(q *MySQLQueue) { q.nowFunc = fn }
+}
+
+func NewMySQLQueue(db *gorm.DB, opts ...QueueOption) *MySQLQueue {
+	q := &MySQLQueue{db: db, nowFunc: func() time.Time { return time.Now().UTC() }}
+	for _, o := range opts {
+		o(q)
+	}
+	return q
 }
 
 // Enqueue 依赖 uk_task(task_type, steam_id64, appid) 唯一键实现幂等。
@@ -3932,8 +4131,11 @@ func (q *MySQLQueue) Enqueue(ctx context.Context, t Task) error {
 		DoUpdates: clause.Assignments(map[string]any{
 			"status":   StatusPending,
 			"attempts": 0,
-			// 取更早的执行时刻：新的紧急需求不应被旧的远期排期压住
-			"next_run_at": gorm.Expr("LEAST(next_run_at, VALUES(next_run_at))"),
+			// 取更早的执行时刻：新的紧急需求不应被旧的远期排期压住。
+			//
+			// 用参数占位而非 VALUES(next_run_at)：后者自 MySQL 8.0.20 起已废弃，
+			// 在 8.4 上会持续打 deprecation warning。传参写法语义相同且不依赖该语法。
+			"next_run_at": gorm.Expr("LEAST(next_run_at, ?)", t.NextRunAt),
 			"payload":     row.Payload,
 			"priority":    row.Priority,
 			"last_error":  "",
@@ -3987,11 +4189,40 @@ func (q *MySQLQueue) Fail(ctx context.Context, id uint64, cause error) error {
 	})
 }
 
-// backoff 计算指数退避间隔：30s、60s、120s…… 上限 6 小时。
+// Defer 推迟任务的执行时刻，但不累加 attempts。
+//
+// 与 Fail 的区别是语义上的：限流、熔断、配额降级都属于「现在不能做」，
+// 而非「做了但失败了」。若走 Fail，配额耗尽的那几个小时里任务会被
+// 反复累加 attempts 直至进入死信 —— 而它们在次日配额重置后本该正常执行。
+func (q *MySQLQueue) Defer(ctx context.Context, id uint64, until time.Time, reason string) error {
+	now := q.nowFunc()
+
+	return q.db.WithContext(ctx).Model(&store.SyncTask{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"status":      StatusPending,
+			"next_run_at": until,
+			"last_error":  truncate(reason, 512),
+			"updated_at":  now,
+			// 刻意不动 attempts
+		}).Error
+}
+
+// backoff 计算指数退避间隔：30s、1m、2m…… 上限 MaxBackoff。
+//
+// attempts 从 1 起算。移位前先判断，避免 uint16 大值导致移位溢出成 0 或负数 ——
+// 那会让退避退化成「立即重试」，在故障期间形成忙循环。
 func backoff(attempts uint16) time.Duration {
-	d := 30 * time.Second << (attempts - 1)
-	if d > 6*time.Hour || d <= 0 {
-		return 6 * time.Hour
+	const base = 30 * time.Second
+
+	// 30s << 10 = 8h32m 已超过上限，无需继续移位
+	if attempts > 10 {
+		return MaxBackoff
+	}
+
+	d := base << (attempts - 1)
+	if d > MaxBackoff {
+		return MaxBackoff
 	}
 	return d
 }
@@ -4002,23 +4233,25 @@ func truncate(s string, n int) string {
 	}
 	return s[:n]
 }
-
-var _ = errors.New
-var _ = fmt.Sprintf
 ```
 
-> `Claim` 方法在 Task 9 实现。本步骤先让 `Enqueue`/`Succeed`/`Fail` 的测试通过。
+> `queue.go` 的导入中不需要 `errors` 与 `fmt`（`Fail` 只用 `truncate`）。若编辑器自动补上了，删掉即可 —— **不要用 `var _ = errors.New` 这类占位行撑住未使用的导入**。
 
-- [ ] **Step 5: 临时跳过 Claim 相关用例并验证**
+> `Claim` 在 Task 9 实现。本任务的测试文件刻意不引用它，因此本包现在就能独立编译并全绿。
 
-Run: `go test ./internal/task/ -run "Enqueue_Insert|Idempotent|EarlierNextRunAt" -v`
-Expected: `TestEnqueue_Idempotent` 与 `TestEnqueue_TakesEarlierNextRunAt` PASS；`TestEnqueue_Insert` 因缺少 `Claim` 而编译失败 —— 这是预期的，进入 Task 9 补齐。
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `go test ./internal/task/ -v`
+Expected: PASS（9 个用例）
+
+注意 `TestBackoff_CapsAtSixHours` 的最后两条断言：它们锁定了 `MaxAttempts` 必须大到让 6 小时上限真实可达。若有人把 `MaxAttempts` 调回 8，这个用例会失败并指出问题 —— 避免「文档写 6h 上限、代码里却是死分支」重新出现。
 
 - [ ] **Step 6: 提交**
 
 ```bash
+go vet ./... && go test ./...
 git add internal/task/
-git commit -m "feat(task): 本地事务表入队幂等与指数退避"
+git commit -m "feat(task): 本地事务表入队幂等、指数退避与推迟语义"
 ```
 
 ---
@@ -4037,13 +4270,14 @@ git commit -m "feat(task): 本地事务表入队幂等与指数退避"
 
 - [ ] **Step 1: 写租约与并发的测试**
 
-创建 `internal/task/claim_test.go`：
+创建 `internal/task/claim_test.go`。本文件包含全部依赖 `Claim` 的用例，包括从 Task 8 移过来的三个（未到期跳过、优先级插队、失败后重排）。
 
 ```go
 package task
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -4057,33 +4291,34 @@ import (
 // 这使得扫描条件无需 OR，租约过期即自动可领。
 func TestClaim_SetsRunningAndExtendsLease(t *testing.T) {
 	db := testDB(t)
-	q := NewMySQLQueue(db)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
 	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
-		NextRunAt: time.Now().UTC().Add(-time.Second),
+		NextRunAt: now.Add(-time.Second),
 	}))
 
 	got, err := q.Claim(ctx, 10, 5*time.Minute)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 
-	var row store.SyncTask
-	require.NoError(t, db.Take(&row).Error)
+	row := takeOnly(t, db)
 	require.Equal(t, StatusRunning, row.Status)
-	require.True(t, row.NextRunAt.After(time.Now().UTC().Add(4*time.Minute)),
+	require.Equal(t, now.Add(5*time.Minute).Unix(), row.NextRunAt.Unix(),
 		"next_run_at 应被推到租约到期时刻")
 }
 
 // 租约未过期时不可被重复领取。
 func TestClaim_DoesNotStealLiveLease(t *testing.T) {
-	q := NewMySQLQueue(testDB(t))
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(testDB(t), fixedClock(now))
 	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
-		NextRunAt: time.Now().UTC().Add(-time.Second),
+		NextRunAt: now.Add(-time.Second),
 	}))
 
 	first, err := q.Claim(ctx, 10, 5*time.Minute)
@@ -4099,12 +4334,13 @@ func TestClaim_DoesNotStealLiveLease(t *testing.T) {
 // 否则会永久卡在「执行中」。
 func TestClaim_ReclaimsExpiredLease(t *testing.T) {
 	db := testDB(t)
-	q := NewMySQLQueue(db)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
 	ctx := context.Background()
 
 	require.NoError(t, q.Enqueue(ctx, Task{
 		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
-		NextRunAt: time.Now().UTC().Add(-time.Second),
+		NextRunAt: now.Add(-time.Second),
 	}))
 
 	claimed, err := q.Claim(ctx, 10, 5*time.Minute)
@@ -4114,7 +4350,7 @@ func TestClaim_ReclaimsExpiredLease(t *testing.T) {
 	// 模拟 worker 崩溃：租约到期但状态仍是「执行中」
 	require.NoError(t, db.Model(&store.SyncTask{}).
 		Where("id = ?", claimed[0].ID).
-		Update("next_run_at", time.Now().UTC().Add(-time.Minute)).Error)
+		Update("next_run_at", now.Add(-time.Minute)).Error)
 
 	reclaimed, err := q.Claim(ctx, 10, 5*time.Minute)
 	require.NoError(t, err)
@@ -4122,33 +4358,129 @@ func TestClaim_ReclaimsExpiredLease(t *testing.T) {
 	require.Equal(t, claimed[0].ID, reclaimed[0].ID)
 }
 
+// 未到期的任务不应被领取。
+func TestClaim_SkipsFutureTasks(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(testDB(t), fixedClock(now))
+	ctx := context.Background()
+
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
+		NextRunAt: now.Add(time.Hour),
+	}))
+
+	got, err := q.Claim(ctx, 10, time.Minute)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+// 优先级必须先于时间生效：回填任务不能插队到实时任务前面。
+func TestClaim_PriorityBeatsTime(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(testDB(t), fixedClock(now))
+	ctx := context.Background()
+	past := now.Add(-time.Hour)
+
+	// 回填任务更早入队
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeAchievementSync, SteamID: 1, AppID: 620,
+		Priority: PriorityBackfill, NextRunAt: past.Add(-time.Hour),
+	}))
+	// 实时任务更晚，但优先级更高
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeSessionSettle, SteamID: 1, AppID: 730,
+		Priority: PriorityRealtime, NextRunAt: past,
+	}))
+
+	got, err := q.Claim(ctx, 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, TypeSessionSettle, got[0].Type, "实时任务必须优先")
+}
+
+// 失败后按退避重排，且到期后可被重新领取。
+func TestClaim_PicksUpRetriedTask(t *testing.T) {
+	db := testDB(t)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
+	ctx := context.Background()
+
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeLibrarySync, SteamID: 1, Priority: PriorityNormal,
+		NextRunAt: now.Add(-time.Second),
+	}))
+
+	claimed, err := q.Claim(ctx, 1, 5*time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, q.Fail(ctx, claimed[0].ID, errors.New("boom")))
+
+	// 退避 30 秒内不可领取
+	none, err := q.Claim(ctx, 1, 5*time.Minute)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	// 时钟推进过退避窗口后可以领取
+	later := NewMySQLQueue(db, fixedClock(now.Add(time.Minute)))
+	again, err := later.Claim(ctx, 1, 5*time.Minute)
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	require.Equal(t, uint16(1), again[0].Attempts)
+}
+
+// Defer 过的任务在到期前不可领取，到期后可以 —— 且 attempts 仍为 0。
+func TestClaim_RespectsDefer(t *testing.T) {
+	db := testDB(t)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	q := NewMySQLQueue(db, fixedClock(now))
+	ctx := context.Background()
+
+	require.NoError(t, q.Enqueue(ctx, Task{
+		Type: TypeAchievementSync, SteamID: 1, AppID: 620,
+		Priority: PriorityBackfill, NextRunAt: now.Add(-time.Second),
+	}))
+	claimed, err := q.Claim(ctx, 1, 5*time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, q.Defer(ctx, claimed[0].ID, now.Add(time.Hour), "配额紧张"))
+
+	none, err := q.Claim(ctx, 1, 5*time.Minute)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	later := NewMySQLQueue(db, fixedClock(now.Add(2*time.Hour)))
+	again, err := later.Claim(ctx, 1, 5*time.Minute)
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	require.Equal(t, uint16(0), again[0].Attempts)
+}
+
 // SKIP LOCKED 保证多 worker 并发扫描不会取到同一条任务。
 // 这个行为在 SQLite 或 mock 上无法验证，必须打真实 MySQL。
 func TestClaim_ConcurrentWorkersDoNotOverlap(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
 
 	const total = 30
-	q := NewMySQLQueue(db)
+	q := NewMySQLQueue(db, fixedClock(now))
 	for i := 0; i < total; i++ {
 		require.NoError(t, q.Enqueue(ctx, Task{
 			Type: TypeAchievementSync, SteamID: 1, AppID: uint32(1000 + i),
-			Priority: PriorityNormal, NextRunAt: time.Now().UTC().Add(-time.Second),
+			Priority: PriorityNormal, NextRunAt: now.Add(-time.Second),
 		}))
 	}
 
 	const workers = 4
 	var (
-		mu     sync.Mutex
-		seen   = map[uint64]int{}
-		wg     sync.WaitGroup
+		mu   sync.Mutex
+		seen = map[uint64]int{}
+		wg   sync.WaitGroup
 	)
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			wq := NewMySQLQueue(db)
+			wq := NewMySQLQueue(db, fixedClock(now))
 			for {
 				got, err := wq.Claim(ctx, 5, 5*time.Minute)
 				if err != nil || len(got) == 0 {
@@ -4253,24 +4585,15 @@ var _ Queue = (*MySQLQueue)(nil)
 - [ ] **Step 4: 运行全部任务表测试**
 
 Run: `go test ./internal/task/ -v`
-Expected: PASS（11 个用例）
+Expected: PASS（17 个用例：Task 8 的 9 个 + 本任务的 8 个）
 
 `TestClaim_ConcurrentWorkersDoNotOverlap` 若失败，检查 MySQL 版本是否 ≥ 8.0.1 —— `SKIP LOCKED` 在更低版本会被静默忽略，导致任务被重复领取。
 
-- [ ] **Step 5: 接上 API 的 Tasks 字段**
-
-取消 `internal/api/router.go` 中 `Deps.Tasks` 字段与 `task` 导入的注释（Task 6 Step 9 遗留），然后编译验证：
+- [ ] **Step 5: 提交**
 
 ```bash
-go build ./... && go vet ./...
-```
-
-Expected: 通过
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add internal/task/ internal/api/
+go vet ./... && go test ./...
+git add internal/task/
 git commit -m "feat(task): SKIP LOCKED 领取与租约回收"
 ```
 
@@ -4573,7 +4896,7 @@ func endEvent(s State) Event {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `go test ./internal/domain/ -v -cover`
-Expected: PASS（11 个子用例 + 4 个独立用例），覆盖率应达到 100%
+Expected: PASS（`TestAdvance_TransitionTable` 下 7 个子用例 + 4 个独立用例，共 11 个），覆盖率应达到 100%
 
 - [ ] **Step 5: 验证包的纯净性**
 
@@ -4605,7 +4928,8 @@ git commit -m "feat(domain): 会话状态机与去抖逻辑"
 - Produces:
   - `store.NewProbeRepo(db *gorm.DB) *ProbeRepo`，方法：
     - `Ensure(ctx, steamID uint64, now time.Time) error` — 绑定时初始化
-    - `Due(ctx, now time.Time, limit int) ([]ProbeState, error)`
+    - `Claim(ctx, now time.Time, limit int, lease time.Duration) ([]ProbeState, error)` — 采集路径专用，含 `SKIP LOCKED` 与租约
+    - `Due(ctx, now time.Time, limit int) ([]ProbeState, error)` — 只读查询，仅供测试
     - `Save(ctx, steamID uint64, s domain.State, tier int8, nextProbeAt, now time.Time) error`
     - `Stale(ctx, before time.Time) ([]ProbeState, error)` — 供启动自愈使用
   - `store.ToDomain(p ProbeState) domain.State`、`store.FromDomain(s domain.State) (appID *uint32, started, lastSeen *time.Time, miss int8)`
@@ -4702,6 +5026,44 @@ func TestProbeRepo_SaveIdleClearsAppID(t *testing.T) {
 	require.Nil(t, row.SessionStartedAt)
 }
 
+// worker 可多实例部署，探针领取必须与任务表一样受 SKIP LOCKED 保护，
+// 否则两个实例会重复探测同一批用户并并发覆写 probe_state ——
+// 去抖计数与 LastSeenPlayingAt 被后写覆盖，直接产出错误会话。
+func TestProbeRepo_ClaimIsExclusive(t *testing.T) {
+	db := testDB(t)
+	r := NewProbeRepo(db)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+
+	for i := uint64(1); i <= 5; i++ {
+		require.NoError(t, r.Ensure(ctx, i, now))
+	}
+
+	first, err := r.Claim(ctx, now, 10, 5*time.Minute)
+	require.NoError(t, err)
+	require.Len(t, first, 5)
+
+	second, err := r.Claim(ctx, now, 10, 5*time.Minute)
+	require.NoError(t, err)
+	require.Empty(t, second, "已被领取的用户在租约内不得被再次领取")
+}
+
+// 租约到期后自动回收，worker 崩溃不会让用户永久停止探测。
+func TestProbeRepo_ClaimReclaimsAfterLease(t *testing.T) {
+	r := NewProbeRepo(testDB(t))
+	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+
+	require.NoError(t, r.Ensure(ctx, 1, now))
+
+	_, err := r.Claim(ctx, now, 10, 5*time.Minute)
+	require.NoError(t, err)
+
+	again, err := r.Claim(ctx, now.Add(6*time.Minute), 10, 5*time.Minute)
+	require.NoError(t, err)
+	require.Len(t, again, 1, "租约过期后必须能被重新领取")
+}
+
 // 供启动自愈使用：找出长时间未被探测但仍标记为「在玩」的僵尸会话。
 func TestProbeRepo_StaleFindsZombieSessions(t *testing.T) {
 	r := NewProbeRepo(testDB(t))
@@ -4762,7 +5124,8 @@ func (r *ProbeRepo) Ensure(ctx context.Context, steamID uint64, now time.Time) e
 		}).Error
 }
 
-// Due 返回到期待探测的用户，按到期时刻升序。
+// Due 返回到期待探测的用户，按到期时刻升序。仅供测试与只读场景使用；
+// 采集路径必须用 Claim，否则多 worker 会重复探测同一批用户。
 func (r *ProbeRepo) Due(ctx context.Context, now time.Time, limit int) ([]ProbeState, error) {
 	var out []ProbeState
 	err := r.db.WithContext(ctx).
@@ -4770,6 +5133,57 @@ func (r *ProbeRepo) Due(ctx context.Context, now time.Time, limit int) ([]ProbeS
 		Order("next_probe_at").
 		Limit(limit).
 		Find(&out).Error
+	return out, err
+}
+
+// Claim 领取到期待探测的用户，并立即把 next_probe_at 推到租约到期时刻。
+//
+// 与任务表同样的道理：worker 设计为可多实例水平扩展，裸 SELECT 会让
+// 两个 worker 取到同一批用户 —— API 调用翻倍事小，两条 advanceOne
+// 并发读改写同一行 probe_state 才是真问题：后写覆盖先写，去抖计数与
+// LastSeenPlayingAt 都可能丢失，直接产出错误的会话记录。
+//
+// 租约到期后未被 Save 更新的行会被自动回收，因此 worker 崩溃不会
+// 让用户永久停止探测。
+func (r *ProbeRepo) Claim(ctx context.Context, now time.Time, limit int,
+	lease time.Duration) ([]ProbeState, error) {
+
+	var out []ProbeState
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var rows []ProbeState
+		if err := tx.Clauses(clause.Locking{
+			Strength: "UPDATE",
+			Options:  "SKIP LOCKED",
+		}).
+			Where("next_probe_at <= ?", now).
+			Order("next_probe_at").
+			Limit(limit).
+			Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+
+		ids := make([]uint64, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.SteamID)
+		}
+
+		if err := tx.Model(&ProbeState{}).
+			Where("steam_id64 IN ?", ids).
+			Updates(map[string]any{
+				"next_probe_at": now.Add(lease),
+				"updated_at":    now,
+			}).Error; err != nil {
+			return err
+		}
+
+		out = rows
+		return nil
+	})
+
 	return out, err
 }
 
@@ -4851,6 +5265,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"steamlink/internal/domain"
 	"steamlink/internal/steam"
@@ -5062,7 +5477,6 @@ func storeTestDB(t *testing.T) *gorm.DB {
 }
 ```
 
-并在 `probe_test.go` 顶部补上 `"gorm.io/gorm"` 导入。
 
 - [ ] **Step 6: 运行测试确认失败**
 
@@ -5123,13 +5537,20 @@ func NewProber(d ProberDeps) *Prober {
 	return &Prober{d: d, lg: d.Logger.With("component", "prober")}
 }
 
-// RunOnce 执行一轮探测：取出到期用户 → 分批调用 → 推进状态机 → 落库并入队。
+// ProbeLease 是探针领取用户后的租约时长。
+// 它必须长于一轮探测的耗时，又不能长到让 worker 崩溃后用户长时间失联。
+const ProbeLease = 5 * time.Minute
+
+// RunOnce 执行一轮探测：领取到期用户 → 分批调用 → 推进状态机 → 落库并入队。
+//
+// 用 Claim 而非 Due：worker 可多实例部署，裸查询会让多个实例
+// 重复探测同一批用户并并发覆写 probe_state。
 func (p *Prober) RunOnce(ctx context.Context) error {
 	now := p.d.Now()
 
-	due, err := p.d.Probes.Due(ctx, now, maxDuePerRun)
+	due, err := p.d.Probes.Claim(ctx, now, maxDuePerRun, ProbeLease)
 	if err != nil {
-		return fmt.Errorf("collector: 查询到期用户失败: %w", err)
+		return fmt.Errorf("collector: 领取到期用户失败: %w", err)
 	}
 	if len(due) == 0 {
 		return nil
@@ -5212,6 +5633,7 @@ func (p *Prober) enqueueSettle(ctx context.Context, steamID uint64,
 	payload, err := json.Marshal(task.SessionPayload{
 		StartedAt: e.StartedAt,
 		EndedAt:   e.EndedAt,
+		Source:    store.SourceProbe, // 探针实测，起止时刻可信
 	})
 	if err != nil {
 		return err
@@ -5256,17 +5678,7 @@ Expected: PASS（5 个用例）
 	}
 ```
 
-在 `internal/api/router.go` 的 `Deps` 中增加字段：
-
-```go
-	Probes *store.ProbeRepo
-```
-
-在 `cmd/api/main.go` 的 `api.Deps{...}` 中补上：
-
-```go
-		Probes: store.NewProbeRepo(db),
-```
+`Deps.Probes` 字段与 `cmd/api/main.go` 中的 `Probes: store.NewProbeRepo(db)` 在 Task 6 已经就位，本步骤只需修改 `probeAndPersist` 的函数体。
 
 - [ ] **Step 10: 编译并运行全部测试**
 
@@ -5477,6 +5889,17 @@ import (
 // 重试永远不会成功，只会持续消耗配额。
 var ErrPermanent = errors.New("task: permanent failure, do not retry")
 
+// ErrDeferred 标记「现在不能做，但不是失败」。handler 用 %w 包装它返回时，
+// 任务被推迟且 attempts 不累加。
+//
+// 限流、熔断、配额降级都属于这一类。它们若走普通失败路径，
+// 配额耗尽的几小时内任务会被反复累加 attempts 直至进入死信 ——
+// 而这些任务在次日配额重置后本该正常执行。
+var ErrDeferred = errors.New("task: deferred, retry later without counting attempt")
+
+// DeferDelay 是被推迟任务的重排间隔。
+const DeferDelay = 15 * time.Minute
+
 type Handler func(ctx context.Context, t Task) error
 
 type RunnerOptions struct {
@@ -5484,6 +5907,7 @@ type RunnerOptions struct {
 	PollInterval time.Duration
 	Lease        time.Duration
 	Logger       *slog.Logger
+	Now          func() time.Time
 }
 
 type Runner struct {
@@ -5507,6 +5931,9 @@ func NewRunner(q Queue, opts RunnerOptions) *Runner {
 	// 全局默认 Logger 会绕过项目的日志配置，且让测试输出变脏。
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	if opts.Now == nil {
+		opts.Now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Runner{
 		q:        q,
@@ -5560,6 +5987,17 @@ func (r *Runner) execute(ctx context.Context, t Task) {
 		lg.Debug("任务执行成功")
 		if e := r.q.Succeed(ctx, t.ID); e != nil {
 			lg.Error("标记任务成功失败", slog.String("err", e.Error()))
+		}
+
+	case errors.Is(err, ErrDeferred):
+		// 限流、熔断、配额降级：不是失败，不计入 attempts。
+		// 若走 Fail，配额耗尽的那几小时会把大量任务推进死信，
+		// 而它们在次日配额重置后本该正常执行。
+		until := r.opts.Now().Add(DeferDelay)
+		lg.Info("任务推迟执行",
+			slog.Time("until", until), slog.String("reason", err.Error()))
+		if e := r.q.Defer(ctx, t.ID, until, err.Error()); e != nil {
+			lg.Error("推迟任务失败", slog.String("err", e.Error()))
 		}
 
 	case errors.Is(err, ErrPermanent):
@@ -5882,35 +6320,49 @@ func NewSessionRepo(db *gorm.DB) *SessionRepo { return &SessionRepo{db: db} }
 // 此处把冲突翻译成 (false, nil) 而非错误 —— 重复不是失败，
 // 若当作失败上报，任务会被无谓重试直到进入死信。
 func (r *SessionRepo) Insert(ctx context.Context, s PlaySession) (bool, error) {
-	res := r.db.WithContext(ctx).
-		Set("gorm:insert_option", "").
-		Clauses(ignoreConflict{}).
+	// DoNothing 在 MySQL 上生成 ON DUPLICATE KEY UPDATE <pk>=<pk>，
+	// 冲突时 RowsAffected 为 0，据此区分「插入了」与「已存在」。
+	res := r.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).
 		Create(&s)
 
 	if res.Error != nil {
-		if isDuplicateKey(res.Error) {
-			return false, nil
-		}
 		return false, res.Error
 	}
 	return res.RowsAffected > 0, nil
 }
 
-// SetPlaytime 更新用户某款游戏的累计时长与最后游玩时刻。
+// SetPlaytime 写入用户某款游戏的累计时长与最后游玩时刻。
+//
+// 必须是 upsert 而非纯 UPDATE。用户当天新购的游戏在 user_games 里还没有行
+//（要等次日 L3 校准才 upsert 进来），纯 UPDATE 会影响 0 行且不报错，
+// 导致下一次结算读到的 prev 仍是 0：
+//
+//	玩 30 分钟 → delta = 30-0 = 30，写会话，SetPlaytime 静默失败
+//	再玩 20 分钟 → Steam 报 50，prev 仍是 0 → delta = 50，再写一条会话
+//	50 分钟的真实游玩被记成 80 分钟，且两条会话 started_at 不同，
+//	uk_session 也拦不住。
 func (r *SessionRepo) SetPlaytime(ctx context.Context, steamID uint64, appID uint32,
 	minutes uint32, lastPlayed *time.Time, now time.Time) error {
 
-	updates := map[string]any{
-		"playtime_forever_min": minutes,
-		"updated_at":           now,
-	}
-	if lastPlayed != nil {
-		updates["rtime_last_played"] = *lastPlayed
+	row := UserGame{
+		SteamID:            steamID,
+		AppID:              appID,
+		PlaytimeForeverMin: minutes,
+		RtimeLastPlayed:    lastPlayed,
+		FirstSeenAt:        now,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 
-	return r.db.WithContext(ctx).Model(&UserGame{}).
-		Where("steam_id64 = ? AND appid = ?", steamID, appID).
-		Updates(updates).Error
+	updates := []string{"playtime_forever_min", "updated_at"}
+	if lastPlayed != nil {
+		updates = append(updates, "rtime_last_played")
+	}
+
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "steam_id64"}, {Name: "appid"}},
+		DoUpdates: clause.AssignmentColumns(updates),
+	}).Create(&row).Error
 }
 
 // HasSessionOn 判断指定自然日（UTC）是否已有该游戏的会话记录。
@@ -5929,30 +6381,20 @@ func (r *SessionRepo) HasSessionOn(ctx context.Context, steamID uint64,
 }
 ```
 
-在 `internal/store/link_repo.go` 中已有 `isDuplicateKey`，此处直接复用。再补上 `ignoreConflict` 子句：
+`session_repo.go` 的导入需包含 `"gorm.io/gorm/clause"`。
 
-```go
-// 追加到 session_repo.go
-import "gorm.io/gorm/clause"
-
-// ignoreConflict 生成 INSERT IGNORE，让唯一键冲突静默跳过。
-type ignoreConflict struct{}
-
-func (ignoreConflict) Name() string { return "INSERT" }
-
-func (ignoreConflict) Build(builder clause.Builder) {
-	_, _ = builder.WriteString("INSERT IGNORE")
-}
-
-func (ignoreConflict) MergeClause(*clause.Clause) {}
-```
+> **不要自定义 clause 来生成 `INSERT IGNORE`。** 一个只实现 `Name()`/`Build()`、`MergeClause` 留空的自定义 clause 是彻底的 no-op：GORM 的 `AddClauseIfNotExists` 判据是 `!ok || c.Expression == nil`，空的 `MergeClause` 不设置 `Expression`，随后 Create callback 里的 `clause.Insert{}` 会把它整个覆盖掉，生成的永远是普通 `INSERT INTO`。
+>
+> 同理，`Set("gorm:insert_option", ...)` 是 GORM v1 的写法，在 v2 中全库无引用，不起任何作用。
+>
+> 若确实需要 `INSERT IGNORE`，正确写法是 `clause.Insert{Modifier: "IGNORE"}`。但这里用 `clause.OnConflict{DoNothing: true}` 更合适 —— 它只对键冲突生效，而 `INSERT IGNORE` 会连数据截断之类的真实错误一并吞掉。
 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `go test ./internal/store/ -run SessionRepo -v`
 Expected: PASS（4 个用例）
 
-若 `INSERT IGNORE` 子句方式在你的 GORM 版本上不生效，退回到显式冲突检测：把 `Create` 的错误传给 `isDuplicateKey` 判断即可，测试断言不变。
+`TestSessionRepo_InsertIsIdempotent` 同时验证了两件事：不报错，且 `ok` 为 `false`。后者依赖 `DoNothing` 在冲突时把 `RowsAffected` 置为 0 —— 如果这条断言挂了，说明冲突子句没有真正生效，而不是测试写错了。
 
 - [ ] **Step 5: 写结算逻辑的测试**
 
@@ -6216,13 +6658,21 @@ func (s *Settler) Handle(ctx context.Context, t task.Task) error {
 	// 时长取 Steam 的真实增量，起始时刻反推
 	started := payload.EndedAt.Add(-time.Duration(delta) * time.Minute)
 
+	// 来源由入队方决定，不在此硬编码：探针捕获的是实测数据，
+	// 启动自愈补结的跨越了宕机窗口，起止时刻不可信，必须标记为推断
+	//（设计文档 §3.2 —— 推断数据不得冒充实测数据）。
+	source := payload.Source
+	if source == 0 {
+		source = store.SourceProbe
+	}
+
 	if _, err := s.d.Sessions.Insert(ctx, store.PlaySession{
 		SteamID:     t.SteamID,
 		AppID:       t.AppID,
 		StartedAt:   started,
 		EndedAt:     payload.EndedAt,
 		DurationMin: delta,
-		Source:      store.SourceProbe,
+		Source:      source,
 		CreatedAt:   now,
 	}); err != nil {
 		return fmt.Errorf("collector: 写入会话失败: %w", err)
@@ -6238,37 +6688,103 @@ func (s *Settler) Handle(ctx context.Context, t task.Task) error {
 		return fmt.Errorf("collector: 更新累计时长失败: %w", err)
 	}
 
-	return s.maybeEnqueueAchievements(ctx, t.SteamID, t.AppID, now)
-}
-
-// maybeEnqueueAchievements 仅对确认有成就系统的游戏入队下钻。
-// has_achievements 为 -1（未知）时先入队 Schema 同步，由它来确定。
-func (s *Settler) maybeEnqueueAchievements(ctx context.Context, steamID uint64,
-	appID uint32, now time.Time) error {
-
-	has, err := s.d.Games.HasAchievements(ctx, appID)
-	if err != nil {
-		return fmt.Errorf("collector: 查询成就标记失败: %w", err)
-	}
-
-	switch has {
-	case 0:
-		return nil // 确认无成就，不必下钻
-	case -1:
-		return s.d.Tasks.Enqueue(ctx, task.Task{
-			Type: task.TypeSchemaSync, AppID: appID,
-			Priority: task.PriorityNormal, NextRunAt: now,
-		})
-	default:
-		return s.d.Tasks.Enqueue(ctx, task.Task{
-			Type: task.TypeAchievementSync, SteamID: steamID, AppID: appID,
-			Priority: task.PriorityNormal, NextRunAt: now,
-		})
-	}
+	return enqueueAchievementSync(ctx, s.d.Games, s.d.Tasks, t.SteamID, t.AppID, now)
 }
 ```
 
-在 `internal/store/game_repo.go` 末尾追加 `HasAchievements`：
+在 `internal/collector/` 下新建 `enqueue.go`，存放两处共用的入队逻辑：
+
+```go
+package collector
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"steamlink/internal/store"
+	"steamlink/internal/task"
+)
+
+// enqueueAchievementSync 为某用户的某款游戏入队成就同步。
+//
+// 只在确认无成就时短路。其余情况一律入队 TypeAchievementSync 而非
+// TypeSchemaSync —— 后者若不带 SteamID，SchemaSyncer 拉完定义就到此为止
+//（它靠 t.SteamID == 0 判断是否要链回成就同步），用户的解锁状态永远拉不到。
+//
+// AchievementSyncer 自身已内建「schema 缺失 → 带 SteamID 入队 SchemaSync →
+// SchemaSync 链回 AchievementSync」的完整路径，把入口收敛到它这里最可靠。
+func enqueueAchievementSync(ctx context.Context, games *store.GameRepo,
+	tasks task.Queue, steamID uint64, appID uint32, now time.Time) error {
+
+	has, err := games.HasAchievements(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("collector: 查询成就标记失败: %w", err)
+	}
+	if has == 0 {
+		return nil // 已确认该游戏没有成就系统
+	}
+
+	return tasks.Enqueue(ctx, task.Task{
+		Type:     task.TypeAchievementSync,
+		SteamID:  steamID,
+		AppID:    appID,
+		Priority: task.PriorityNormal,
+		NextRunAt: now,
+	})
+}
+
+// handlePrivateStrike 处理「探测到用户资料非公开」。
+//
+// Reconciler 与 AchievementSyncer 都会遇到这个分支，逻辑必须一致，
+// 因此收敛到此处。达到阈值前返回可重试错误，达到阈值后返回永久错误
+// 并落库精确的可见性状态。
+func handlePrivateStrike(ctx context.Context, links *store.LinkRepo,
+	sc steam.Client, steamID uint64) error {
+
+	n, err := links.BumpPrivateStrikes(ctx, steamID)
+	if err != nil {
+		return fmt.Errorf("collector: 累加私密计数失败: %w", err)
+	}
+
+	if n < PrivateStrikeLimit {
+		return fmt.Errorf("collector: 用户 %d 资料非公开（第 %d 次）", steamID, n)
+	}
+
+	// 达到阈值才做一次精确探测：GetOwnedGames 对「整个资料私密」和
+	// 「仅游戏详情私密」返回完全相同的空对象，无法区分。若一律写成
+	// GameDetailsPrivate，前端会给出错误的引导文案 —— 用户照着改也修不好。
+	// 这次额外调用只在用户确实持续私密时发生，成本可控。
+	state := store.VisibilityGameDetailsPrivate
+	if sums, e := sc.GetPlayerSummaries(ctx, []uint64{steamID}); e == nil &&
+		len(sums) > 0 && sums[0].CommunityVisibilityState != 3 {
+		state = store.VisibilityProfilePrivate
+	}
+
+	if err := links.UpdateVisibility(ctx, steamID, state); err != nil {
+		return err
+	}
+	return fmt.Errorf("collector: 用户 %d 连续 %d 次探测到非公开: %w",
+		steamID, n, task.ErrPermanent)
+}
+```
+
+`enqueue.go` 的导入需包含 `"steamlink/internal/steam"`。
+
+在 `internal/store/game_repo.go` 末尾追加 `HasAchievements`。该文件的导入块此时应为：
+
+```go
+import (
+	"context"
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"steamlink/internal/steam"
+)
+```
 
 ```go
 // HasAchievements 返回 apps.has_achievements：-1 未知、0 无成就、1 有成就。
@@ -6286,7 +6802,6 @@ func (r *GameRepo) HasAchievements(ctx context.Context, appID uint32) (int8, err
 }
 ```
 
-在该文件顶部补上 `"errors"` 导入，并删除文件末尾的 `var _ = gorm.ErrRecordNotFound` 占位行。
 
 - [ ] **Step 8: 运行测试确认通过**
 
@@ -6336,7 +6851,8 @@ git commit -m "feat(collector): L1 会话结算与时长差分"
 - Produces:
   - `collector.NewReconciler(deps ReconcilerDeps) *Reconciler`，`ReconcilerDeps` 字段：`Steam steam.Client`、`Games *store.GameRepo`、`Sessions *store.SessionRepo`、`Links *store.LinkRepo`、`Tasks task.Queue`、`Now func() time.Time`
   - `(*Reconciler).Handle(ctx context.Context, t task.Task) error`
-  - `(*Reconciler).ScheduleDaily(ctx context.Context) error` — 为所有活跃用户入队次日校准
+  - `(*Reconciler).ScheduleDaily(ctx context.Context) error` — 为距上次校准超过 `ReconcileInterval` 的用户入队
+  - `collector.ReconcileInterval = 20 * time.Hour`
   - `collector.NewHealer(probes *store.ProbeRepo, tasks task.Queue, now func() time.Time) *Healer`
   - `(*Healer).Run(ctx context.Context) error`
   - `collector.PrivateStrikeLimit int8 = 3`
@@ -6354,6 +6870,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
@@ -6529,9 +7046,50 @@ func TestReconciler_ScheduleDailyCoversActiveUsers(t *testing.T) {
 	require.Len(t, rows, 1)
 	require.Equal(t, uint64(1), rows[0].SteamID)
 }
-```
 
-在文件顶部补上 `"gorm.io/gorm"` 导入。
+// worker 重启会再次调用 ScheduleDaily。刚校准过的用户不得被重新排队 ——
+// 否则每次重启都触发一轮全量 GetOwnedGames，1000 用户就烧掉 L3 一整天的预算。
+func TestReconciler_ScheduleDailySkipsRecentlyVerified(t *testing.T) {
+	db := storeTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 3, 0, 0, 0, time.UTC)
+
+	links := store.NewLinkRepo(db)
+	require.NoError(t, links.Link(ctx, 1001, 1))
+	// 模拟刚刚成功校准过（UpdateVisibility 会写入 last_verified_at）
+	require.NoError(t, links.UpdateVisibility(ctx, 1, store.VisibilityOK))
+
+	r := newReconciler(t, &ownedStub{}, db, now)
+	require.NoError(t, r.ScheduleDaily(ctx))
+
+	var n int64
+	require.NoError(t, db.Model(&store.SyncTask{}).
+		Where("task_type = ?", task.TypeLibrarySync).Count(&n).Error)
+	require.Zero(t, n, "刚校准过的用户不应被重新排队")
+}
+
+// 反过来，超过间隔未校准的用户必须被捞回来 ——
+// 这同时覆盖了「worker 停机一整天，那天的校准要能补上」的场景。
+func TestReconciler_ScheduleDailyPicksUpOverdueUsers(t *testing.T) {
+	db := storeTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 26, 3, 0, 0, 0, time.UTC)
+
+	links := store.NewLinkRepo(db)
+	require.NoError(t, links.Link(ctx, 1001, 1))
+	require.NoError(t, links.UpdateVisibility(ctx, 1, store.VisibilityOK))
+	require.NoError(t, db.Model(&store.SteamLink{}).Where("steam_id64 = ?", 1).
+		Update("last_verified_at", now.Add(-30*time.Hour)).Error)
+
+	r := newReconciler(t, &ownedStub{}, db, now)
+	require.NoError(t, r.ScheduleDaily(ctx))
+
+	var n int64
+	require.NoError(t, db.Model(&store.SyncTask{}).
+		Where("task_type = ?", task.TypeLibrarySync).Count(&n).Error)
+	require.Equal(t, int64(1), n)
+}
+```
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -6588,7 +7146,7 @@ func (r *Reconciler) Handle(ctx context.Context, t task.Task) error {
 
 	owned, err := r.d.Steam.GetOwnedGames(ctx, t.SteamID)
 	if errors.Is(err, steam.ErrProfilePrivate) {
-		return r.handlePrivate(ctx, t.SteamID)
+		return handlePrivateStrike(ctx, r.d.Links, r.d.Steam, t.SteamID)
 	}
 	if err != nil {
 		return fmt.Errorf("collector: 拉取游戏库失败: %w", err)
@@ -6652,58 +7210,30 @@ func (r *Reconciler) reconcileGame(ctx context.Context, steamID uint64,
 		}
 	}
 
-	return r.enqueueAchievementsIfAny(ctx, steamID, g.AppID, now)
+	return enqueueAchievementSync(ctx, r.d.Games, r.d.Tasks, steamID, g.AppID, now)
 }
 
-func (r *Reconciler) enqueueAchievementsIfAny(ctx context.Context, steamID uint64,
-	appID uint32, now time.Time) error {
+// ReconcileInterval 是两次校准之间的最小间隔。
+// 取 20 小时而非 24：留出余量，避免因执行耗时导致某天被跳过。
+const ReconcileInterval = 20 * time.Hour
 
-	has, err := r.d.Games.HasAchievements(ctx, appID)
-	if err != nil {
-		return fmt.Errorf("collector: 查询成就标记失败: %w", err)
-	}
-
-	switch has {
-	case 0:
-		return nil
-	case -1:
-		return r.d.Tasks.Enqueue(ctx, task.Task{
-			Type: task.TypeSchemaSync, AppID: appID,
-			Priority: task.PriorityNormal, NextRunAt: now,
-		})
-	default:
-		return r.d.Tasks.Enqueue(ctx, task.Task{
-			Type: task.TypeAchievementSync, SteamID: steamID, AppID: appID,
-			Priority: task.PriorityNormal, NextRunAt: now,
-		})
-	}
-}
-
-// handlePrivate 累加 strike 计数，达到阈值后停止重试并落库可见性状态。
-func (r *Reconciler) handlePrivate(ctx context.Context, steamID uint64) error {
-	n, err := r.d.Links.BumpPrivateStrikes(ctx, steamID)
-	if err != nil {
-		return fmt.Errorf("collector: 累加私密计数失败: %w", err)
-	}
-
-	if n >= PrivateStrikeLimit {
-		if err := r.d.Links.UpdateVisibility(ctx, steamID,
-			store.VisibilityGameDetailsPrivate); err != nil {
-			return err
-		}
-		return fmt.Errorf("collector: 用户 %d 连续 %d 次探测到非公开: %w",
-			steamID, n, task.ErrPermanent)
-	}
-	return fmt.Errorf("collector: 用户 %d 资料非公开（第 %d 次）", steamID, n)
-}
-
-// ScheduleDaily 为所有活跃用户入队次日校准，执行时刻打散到一个时间窗内。
+// ScheduleDaily 为「距上次成功校准超过 ReconcileInterval」的用户入队，
+// 执行时刻打散到一个时间窗内。
+//
+// 必须按 last_verified_at 过滤，不能无条件全量入队。原因是 Enqueue 的
+// LEAST(next_run_at, ?) 语义：已成功任务的 next_run_at 是过去的时刻，
+// LEAST 会保留那个过去值，于是任务复活为 Pending 且立即到期。
+// worker 每重启一次就会触发一轮全量 GetOwnedGames —— 1000 用户就是
+// 1000 次调用，而 L3 一整天的预算才 1000 次。
+//
+// 按 last_verified_at 过滤还顺带解决了另一个问题：worker 停机一整天时，
+// 那天漏掉的校准会在重启后自动补上。
 func (r *Reconciler) ScheduleDaily(ctx context.Context) error {
 	now := r.d.Now()
 
-	ids, err := r.d.Links.ActiveSteamIDs(ctx)
+	ids, err := r.d.Links.StaleSteamIDs(ctx, now.Add(-ReconcileInterval))
 	if err != nil {
-		return fmt.Errorf("collector: 查询活跃用户失败: %w", err)
+		return fmt.Errorf("collector: 查询待校准用户失败: %w", err)
 	}
 	if len(ids) == 0 {
 		return nil
@@ -6738,6 +7268,7 @@ package collector
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -6776,6 +7307,13 @@ func TestHealer_ForceSettlesZombieSessions(t *testing.T) {
 	require.NoError(t, db.Take(&row).Error)
 	require.Equal(t, task.TypeSessionSettle, row.Type)
 	require.Equal(t, uint32(440), row.AppID)
+
+	// 关键：这条会话跨越了宕机窗口，必须标记为推断而非实测。
+	// 设计 §3.2 立下的原则是「推断数据不得冒充实测数据」。
+	var payload task.SessionPayload
+	require.NoError(t, json.Unmarshal(row.Payload, &payload))
+	require.Equal(t, store.SourceReconcile, payload.Source,
+		"自愈补结的会话必须标记为推断来源")
 }
 
 // 近期仍在正常探测的会话不得被自愈打断。
@@ -6863,6 +7401,9 @@ func (h *Healer) Run(ctx context.Context) error {
 		payload, err := json.Marshal(task.SessionPayload{
 			StartedAt: state.StartedAt,
 			EndedAt:   state.LastSeenPlayingAt,
+			// 这条会话跨越了 worker 的宕机窗口，真实结束时刻无从得知。
+			// 标记为推断，不得以实测数据的身份进入永久事件流。
+			Source: store.SourceReconcile,
 		})
 		if err != nil {
 			return err
@@ -7179,17 +7720,30 @@ func (r *GameRepo) UpsertAchievementSchema(ctx context.Context, appID uint32,
 }
 
 // MarkAppAchievements 标记某款游戏是否有成就系统及成就总数。
+//
+// 必须是 upsert：新购游戏可能在 L3 校准把它写进 apps 表之前，
+// 就被 L1 结算触发了成就同步。此时纯 UPDATE 影响 0 行且不报错，
+// has_achievements 永远停留在「无行 → -1」，于是每次游玩都重新
+// 入队一次 SchemaSync，每次白烧一回 GetSchemaForGame —— 正是
+// 设计 §6.5 警告的「陷入死循环并持续消耗配额」。
 func (r *GameRepo) MarkAppAchievements(ctx context.Context, appID uint32,
 	has int8, total uint16, now time.Time) error {
 
-	return r.db.WithContext(ctx).Model(&App{}).
-		Where("appid = ?", appID).
-		Updates(map[string]any{
-			"has_achievements": has,
-			"ach_total":        total,
-			"schema_synced_at": now,
-			"updated_at":       now,
-		}).Error
+	row := App{
+		AppID:           appID,
+		HasAchievements: has,
+		AchTotal:        total,
+		SchemaSyncedAt:  &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "appid"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"has_achievements", "ach_total", "schema_synced_at", "updated_at",
+		}),
+	}).Create(&row).Error
 }
 
 func (r *GameRepo) SchemaAchievementCount(ctx context.Context, appID uint32) (int64, error) {
@@ -7289,7 +7843,7 @@ Expected: PASS（5 个用例）
 
 `app_achievements.global_pct` 用于展示成就稀有度。数据来自 `GetGlobalAchievementPercentagesForApp`，它按 appid 全局共享，且**不需要 API Key**。与成就定义同属一个 appid 维度的工作单元，因此并入同一个任务同步。
 
-在 `internal/steam/client_test.go` 末尾追加：
+在 `internal/steam/client_test.go` 末尾追加。**先在该文件的导入块中加入 `"io"`**，否则下面这段贴完不编译：
 
 ```go
 func TestGetGlobalAchievementPercentages(t *testing.T) {
@@ -7313,9 +7867,7 @@ func TestGetGlobalAchievementPercentages(t *testing.T) {
 }
 ```
 
-在该文件顶部补上 `"io"` 导入。
-
-在 `internal/collector/schema_test.go` 末尾追加：
+在 `internal/collector/schema_test.go` 末尾追加。**先在该文件的导入块中加入 `"errors"`**：
 
 ```go
 func (s *schemaStub) GetGlobalAchievementPercentages(context.Context, uint32) (map[string]float64, error) {
@@ -7376,8 +7928,6 @@ func (s *pctFailStub) GetGlobalAchievementPercentages(context.Context, uint32) (
 	return nil, errors.New("service unavailable")
 }
 ```
-
-在该文件顶部补上 `"errors"` 导入。
 
 - [ ] **Step 7: 实现全球解锁率拉取**
 
@@ -7515,10 +8065,12 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
@@ -7692,8 +8244,6 @@ func TestAchievementSyncer_RequiresSchemaFirst(t *testing.T) {
 }
 ```
 
-在文件顶部补上 `"errors"` 与 `"gorm.io/gorm"` 导入。
-
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `go test ./internal/collector/ -run AchievementSyncer -v`
@@ -7822,7 +8372,7 @@ func (a *AchievementSyncer) Handle(ctx context.Context, t task.Task) error {
 
 	case errors.Is(err, steam.ErrProfilePrivate):
 		// 用户级：只影响这一个用户，不得触碰 apps 表
-		return a.handlePrivate(ctx, t.SteamID)
+		return handlePrivateStrike(ctx, a.d.Links, a.d.Steam, t.SteamID)
 
 	case err != nil:
 		return fmt.Errorf("collector: 拉取玩家成就失败: %w", err)
@@ -7855,23 +8405,6 @@ func (a *AchievementSyncer) Handle(ctx context.Context, t task.Task) error {
 
 	return a.d.Games.SetAchievementProgress(ctx, t.SteamID, t.AppID,
 		uint16(len(rows)), uint16(total), now)
-}
-
-func (a *AchievementSyncer) handlePrivate(ctx context.Context, steamID uint64) error {
-	n, err := a.d.Links.BumpPrivateStrikes(ctx, steamID)
-	if err != nil {
-		return fmt.Errorf("collector: 累加私密计数失败: %w", err)
-	}
-
-	if n >= PrivateStrikeLimit {
-		if err := a.d.Links.UpdateVisibility(ctx, steamID,
-			store.VisibilityGameDetailsPrivate); err != nil {
-			return err
-		}
-		return fmt.Errorf("collector: 用户 %d 连续 %d 次探测到非公开: %w",
-			steamID, n, task.ErrPermanent)
-	}
-	return fmt.Errorf("collector: 用户 %d 资料非公开（第 %d 次）", steamID, n)
 }
 ```
 
@@ -8082,7 +8615,7 @@ Expected: PASS（3 个用例）
 
 - [ ] **Step 5: 在绑定流程中触发回填**
 
-修改 `internal/api/auth_handler.go` 的 `probeAndPersist`：
+修改 `internal/api/auth_handler.go` 的 `probeAndPersist`。**先在该文件的导入块中加入 `"steamlink/internal/collector"`**（`log/slog` 与 `steamlink/internal/logging` 在 Task 6 已导入）：
 
 ```go
 	if state == store.VisibilityOK && len(games) > 0 {
@@ -8101,8 +8634,6 @@ Expected: PASS（3 个用例）
 		}
 	}
 ```
-
-在文件顶部补上 `"log/slog"`、`"steamlink/internal/collector"` 与 `"steamlink/internal/logging"` 导入。
 
 - [ ] **Step 6: 实现成就查询**
 
@@ -8285,14 +8816,12 @@ func (d Deps) handleRecentAchievements(c *gin.Context) {
 		api.GET("/achievements/recent", d.handleRecentAchievements)
 ```
 
-在 `cmd/api/main.go` 的 `api.Deps{...}` 中补上：
+在 `cmd/api/main.go` 中加入 `"steamlink/internal/task"` 导入，并在 `api.Deps{...}` 中补上两个字段：
 
 ```go
 		Sessions: store.NewSessionRepo(db),
 		Tasks:    task.NewMySQLQueue(db),
 ```
-
-并补上 `"steamlink/internal/task"` 导入。
 
 - [ ] **Step 7: 编译并运行全部测试**
 
@@ -8598,10 +9127,10 @@ package collector
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"steamlink/internal/steam"
 	"steamlink/internal/task"
 )
 
@@ -8670,10 +9199,31 @@ func TestWithQuotaGuard_DeferIsRetryable(t *testing.T) {
 
 	err := h(context.Background(), task.Task{Priority: task.PriorityNormal})
 	require.NotErrorIs(t, err, task.ErrPermanent)
+	require.ErrorIs(t, err, task.ErrDeferred,
+		"必须被 Runner 识别为推迟，否则会累加 attempts 并最终进入死信")
 }
 
-var _ = time.Now
+// 本地限流与熔断同样应转成推迟，而非计为任务失败。
+func TestWithQuotaGuard_ConvertsThrottleToDefer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"本地令牌桶", steam.ErrThrottled},
+		{"熔断", steam.ErrCircuitOpen},
+		{"日配额耗尽", steam.ErrQuotaExhausted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := WithQuotaGuard(fixedGuard{DegradeNone}, task.PriorityNormal,
+				func(context.Context, task.Task) error { return tc.err })
+
+			err := h(context.Background(), task.Task{Priority: task.PriorityBackfill})
+			require.ErrorIs(t, err, task.ErrDeferred)
+		})
+	}
+}
 ```
+
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -8697,9 +9247,11 @@ import (
 )
 
 // ErrDeferredByQuota 表示任务因配额压力被推迟。
-// 它是可重试的普通错误 —— 绝不能是 task.ErrPermanent，
-// 否则次日配额重置后这些任务永远不会再执行。
-var ErrDeferredByQuota = errors.New("collector: deferred due to quota pressure")
+//
+// 它包装 task.ErrDeferred，因此 Runner 会走 Defer 路径 —— 推迟但不累加
+// attempts。这一点是必需的：配额耗尽可能持续数小时到次日，若按普通失败
+// 累加 attempts，这批任务会在配额恢复前就被推进死信。
+var ErrDeferredByQuota = fmt.Errorf("collector: 配额压力下推迟: %w", task.ErrDeferred)
 
 type DegradeLevel int
 
@@ -8765,7 +9317,20 @@ func WithQuotaGuard(g QuotaGuard, minPriority int8, h task.Handler) task.Handler
 				return fmt.Errorf("配额紧张，推迟低优先级任务: %w", ErrDeferredByQuota)
 			}
 		}
-		return h(ctx, t)
+
+		err = h(ctx, t)
+
+		// 本地令牌桶拒绝、熔断、日配额耗尽都不是任务本身的失败，
+		// 统一转成推迟。否则回填高峰期任务会因反复触发限流而被推入死信。
+		switch {
+		case errors.Is(err, steam.ErrThrottled):
+			return fmt.Errorf("本地限流，稍后重试: %w", task.ErrDeferred)
+		case errors.Is(err, steam.ErrCircuitOpen):
+			return fmt.Errorf("熔断中，稍后重试: %w", task.ErrDeferred)
+		case errors.Is(err, steam.ErrQuotaExhausted):
+			return fmt.Errorf("日配额已耗尽: %w", task.ErrDeferred)
+		}
+		return err
 	}
 }
 ```
@@ -9070,7 +9635,11 @@ func newRig(t *testing.T, start time.Time) *rig {
 	nowFn := func() time.Time { return r.now }
 
 	sc := steam.New("testkey", steam.WithBaseURL(fake.URL()))
-	queue := task.NewMySQLQueue(db)
+
+	// 队列必须用同一个假时钟。若它固定用 time.Now，Claim 会拿真实墙钟
+	// 去比对假时钟写入的 next_run_at —— 「延迟 5 分钟结算」这类断言会变成
+	// 时间炸弹：真实时间早于假时间时通过，晚于则任务被立刻领走，测试挂掉。
+	queue := task.NewMySQLQueue(db, task.WithClock(nowFn))
 	probes := store.NewProbeRepo(db)
 	games := store.NewGameRepo(db)
 	sessions := store.NewSessionRepo(db)
@@ -9083,6 +9652,7 @@ func newRig(t *testing.T, start time.Time) *rig {
 
 	runner := task.NewRunner(queue, task.RunnerOptions{
 		Concurrency: 1,
+		Now:         nowFn,
 		// 不注入 Logger，NewRunner 会自动回退到 DiscardHandler
 	})
 	runner.Register(task.TypeSessionSettle, collector.NewSettler(collector.SettlerDeps{
@@ -9134,11 +9704,15 @@ func TestTimeline_FullSessionProducesAccurateRecord(t *testing.T) {
 	r.fake.StartPlaying(testSteamID, 440)
 	r.probe(t)
 
-	// 20:02 ~ 20:30 持续游玩，探针每 2 分钟一次
-	for i := 0; i < 14; i++ {
+	// 20:02 ~ 20:30 持续游玩，探针每 2 分钟一次。
+	// 15 次而非 14：最后一次探测必须落在 20:30，因为 SessionEnded 的
+	// EndedAt 取的是 LastSeenPlayingAt（最后一次观测到在玩的时刻）。
+	// 少一次就是 20:28，后面所有时刻断言都会偏移 2 分钟。
+	for i := 0; i < 15; i++ {
 		r.advance(2 * time.Minute)
 		r.probe(t)
 	}
+	require.Equal(t, start.Add(30*time.Minute), r.now, "此刻应为 20:30")
 
 	// 20:30 用户退出。Steam 侧结算 30 分钟。
 	r.fake.StopPlaying(testSteamID, 440, 30)
@@ -9304,9 +9878,14 @@ git commit -m "test(e2e): 完整游玩时间线的端到端验证"
 - [ ] `grep -rn "api_key\|state_secret" configs/` 确认全部为空值
 - [ ] 不设任何 `STEAMLINK_*` 环境变量直接启动，确认进程立即退出并提示缺失的具体变量名
 - [ ] `APP_ENV=prod` 且不设 `STEAMLINK_HTTP_BASE_URL` 时启动失败
-- [ ] 绑定一个游戏详情非公开的测试账号，确认返回 `game_details_private` 且带可操作的提示文案
+- [ ] 绑定一个游戏详情非公开的测试账号，确认跳转回前端时 `status=game_details_private`，页面给出可操作的提示文案
+- [ ] 用浏览器完整走一遍绑定：顶层导航到 `/auth/steam/login`，Steam 授权后落回前端页面（**不是一屏 JSON**）
 - [ ] 手动 kill 一个执行中的 worker，确认 5 分钟后任务被另一实例回收
+- [ ] 起两个 worker 实例，确认同一批用户不会被重复探测（观察 `steam:quota:{date}` 增速是否接近单实例）
+- [ ] 重启 worker 两次，确认 `sync_tasks` 中 `task_type=1` 的待执行任务数没有暴涨到全量用户数
 - [ ] 观察一天的 `steam:quota:{date}` 计数，确认稳态日调用量在 5,000 以内
+- [ ] 造一条 `source=2` 的推断会话，确认前端与 `source=1` 的实测会话区别展示
+- [ ] `grep -rn "var _ = " --include="*.go" internal/` 无输出（不得用占位行撑住未使用的导入）
 
 ## 部署
 
