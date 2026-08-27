@@ -51,6 +51,9 @@ func main() {
 
 	queue := task.NewMySQLQueue(db)
 	probes := store.NewProbeRepo(db)
+	gameRepo := store.NewGameRepo(db)
+	sessionRepo := store.NewSessionRepo(db)
+	linkRepo := store.NewLinkRepo(db)
 
 	prober := collector.NewProber(collector.ProberDeps{
 		Steam: sc, Probes: probes, Tasks: queue, Logger: lg,
@@ -63,12 +66,22 @@ func main() {
 	})
 	settler := collector.NewSettler(collector.SettlerDeps{
 		Steam:    sc,
-		Games:    store.NewGameRepo(db),
-		Sessions: store.NewSessionRepo(db),
+		Games:    gameRepo,
+		Sessions: sessionRepo,
 		Tasks:    queue,
 	})
 	runner.Register(task.TypeSessionSettle, settler.Handle)
-	// 其余 handler 在 Task 14、15、16 中逐步注册
+
+	schemaSyncer := collector.NewSchemaSyncer(collector.SchemaDeps{
+		Steam: sc, Games: gameRepo, Tasks: queue,
+	})
+	runner.Register(task.TypeSchemaSync, schemaSyncer.Handle)
+
+	achSyncer := collector.NewAchievementSyncer(collector.AchievementDeps{
+		Steam: sc, Games: gameRepo, Sessions: sessionRepo,
+		Links: linkRepo, Tasks: queue,
+	})
+	runner.Register(task.TypeAchievementSync, achSyncer.Handle)
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
@@ -76,9 +89,9 @@ func main() {
 
 	reconciler := collector.NewReconciler(collector.ReconcilerDeps{
 		Steam:    sc,
-		Games:    store.NewGameRepo(db),
-		Sessions: store.NewSessionRepo(db),
-		Links:    store.NewLinkRepo(db),
+		Games:    gameRepo,
+		Sessions: sessionRepo,
+		Links:    linkRepo,
 		Tasks:    queue,
 	})
 	runner.Register(task.TypeLibrarySync, reconciler.Handle)

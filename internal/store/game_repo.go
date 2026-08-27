@@ -245,3 +245,18 @@ func (r *GameRepo) UpdateGlobalPercentages(ctx context.Context, appID uint32,
 		return nil
 	})
 }
+
+// SetAchievementProgress 回写用户某款游戏的成就进度，供列表页直接展示，
+// 避免每次查询都聚合 achievement_unlocks 表。
+func (r *GameRepo) SetAchievementProgress(ctx context.Context, steamID uint64,
+	appID uint32, unlocked, total uint16, now time.Time) error {
+
+	return r.db.WithContext(ctx).Model(&UserGame{}).
+		Where("steam_id64 = ? AND appid = ?", steamID, appID).
+		Updates(map[string]any{
+			"ach_unlocked":  unlocked,
+			"ach_total":     total,
+			"ach_synced_at": now,
+			"updated_at":    now,
+		}).Error
+}

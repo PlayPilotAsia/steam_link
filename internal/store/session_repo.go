@@ -78,3 +78,28 @@ func (r *SessionRepo) HasSessionOn(ctx context.Context, steamID uint64,
 		Count(&n).Error
 	return n > 0, err
 }
+
+// UpsertUnlocks 批量写入成就解锁记录。
+//
+// 主键 (steam_id64, appid, api_name) 天然幂等，解锁时刻取自 Steam 的
+// unlocktime。成就与时长的本质差异在此：成就自带精确时间戳，
+// 不需要 diff 逻辑，重复同步无害。
+func (r *SessionRepo) UpsertUnlocks(ctx context.Context, steamID uint64,
+	appID uint32, unlocks []AchievementUnlock, now time.Time) error {
+
+	if len(unlocks) == 0 {
+		return nil
+	}
+
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "steam_id64"}, {Name: "appid"}, {Name: "api_name"}},
+		DoNothing: true,
+	}).CreateInBatches(&unlocks, 200).Error
+}
+
+func (r *SessionRepo) CountUnlocks(ctx context.Context, steamID uint64, appID uint32) (int64, error) {
+	var n int64
+	err := r.db.WithContext(ctx).Model(&AchievementUnlock{}).
+		Where("steam_id64 = ? AND appid = ?", steamID, appID).Count(&n).Error
+	return n, err
+}
