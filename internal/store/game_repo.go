@@ -260,3 +260,12 @@ func (r *GameRepo) SetAchievementProgress(ctx context.Context, steamID uint64,
 			"updated_at":    now,
 		}).Error
 }
+
+func (r *GameRepo) ListAchievementDefs(ctx context.Context, appID uint32) ([]AppAchievement, error) {
+	var out []AppAchievement
+	err := r.db.WithContext(ctx).
+		Where("appid = ?", appID).
+		Order("api_name").
+		Find(&out).Error
+	return out, err
+}

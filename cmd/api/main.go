@@ -10,6 +10,7 @@ import (
 	"steamlink/internal/logging"
 	"steamlink/internal/steam"
 	"steamlink/internal/store"
+	"steamlink/internal/task"
 )
 
 // configDir 可由 CONFIG_DIR 覆盖，便于容器中挂载到别处。
@@ -52,6 +53,8 @@ func main() {
 		Links:       store.NewLinkRepo(db),
 		Games:       store.NewGameRepo(db),
 		Probes:      store.NewProbeRepo(db),
+		Sessions:    store.NewSessionRepo(db),
+		Tasks:       task.NewMySQLQueue(db),
 		Steam:       sc,
 		Verifier:    auth.NewVerifier(),
 		Auth:        auth.NewSessionStore(rdb, cfg.Auth.SessionTTL),

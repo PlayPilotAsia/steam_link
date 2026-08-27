@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"steamlink/internal/auth"
+	"steamlink/internal/collector"
 	"steamlink/internal/logging"
 	"steamlink/internal/store"
 )
@@ -193,6 +194,16 @@ func (d Deps) probeAndPersist(c *gin.Context, steamID uint64) LinkStatusResponse
 		_ = d.Games.UpsertUserGames(ctx, steamID, games, now)
 		// 初始化探针状态，让新用户立即进入采集范围
 		_ = d.Probes.Ensure(ctx, steamID, now)
+
+		// 全库成就回填，低优先级后台慢速执行
+		appIDs := make([]uint32, 0, len(games))
+		for _, g := range games {
+			appIDs = append(appIDs, g.AppID)
+		}
+		if err := collector.EnqueueBackfill(ctx, d.Tasks, steamID, appIDs, now); err != nil {
+			d.Logger.Error("入队成就回填失败",
+				logging.SteamID(steamID), slog.String("err", err.Error()))
+		}
 	}
 
 	slug, hint := visibilityHint(state)

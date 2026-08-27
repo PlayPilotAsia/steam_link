@@ -103,3 +103,43 @@ func (r *SessionRepo) CountUnlocks(ctx context.Context, steamID uint64, appID ui
 		Where("steam_id64 = ? AND appid = ?", steamID, appID).Count(&n).Error
 	return n, err
 }
+
+func (r *SessionRepo) ListUnlocks(ctx context.Context, steamID uint64,
+	appID uint32) ([]AchievementUnlock, error) {
+
+	var out []AchievementUnlock
+	err := r.db.WithContext(ctx).
+		Where("steam_id64 = ? AND appid = ?", steamID, appID).
+		Order("unlocked_at DESC").
+		Find(&out).Error
+	return out, err
+}
+
+// UnlockRow 是成就时间线的展示行。
+type UnlockRow struct {
+	AppID       uint32    `gorm:"column:appid"`
+	AppName     string    `gorm:"column:app_name"`
+	APIName     string    `gorm:"column:api_name"`
+	DisplayName string    `gorm:"column:display_name"`
+	Icon        string    `gorm:"column:icon"`
+	UnlockedAt  time.Time `gorm:"column:unlocked_at"`
+}
+
+// RecentUnlocks 返回最近解锁的成就时间线。
+// unlocked_at 取自 Steam 的 unlocktime，是精确值而非推断值。
+func (r *SessionRepo) RecentUnlocks(ctx context.Context, steamID uint64,
+	limit int) ([]UnlockRow, error) {
+
+	var out []UnlockRow
+	err := r.db.WithContext(ctx).
+		Table("achievement_unlocks AS u").
+		Select(`u.appid, a.name AS app_name, u.api_name,
+		        d.display_name, d.icon, u.unlocked_at`).
+		Joins("LEFT JOIN apps AS a ON a.appid = u.appid").
+		Joins("LEFT JOIN app_achievements AS d ON d.appid = u.appid AND d.api_name = u.api_name").
+		Where("u.steam_id64 = ?", steamID).
+		Order("u.unlocked_at DESC").
+		Limit(limit).
+		Scan(&out).Error
+	return out, err
+}
