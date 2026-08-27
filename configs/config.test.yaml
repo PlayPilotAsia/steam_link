@@ -1,0 +1,13 @@
+# test：本地运行服务，连阿里云实例（公网 IP）。
+#
+# mysql.host 与 redis.addr 刻意不写在这里 —— 公网地址与密码一并由
+# configs/test.env 注入，避免实例地址进入仓库。
+#
+# base_url 仍是 localhost：服务跑在本机，Steam 是用 302 把「用户浏览器」
+# 重定向回来的，不需要公网可达。
+http:
+  base_url: "http://localhost:8080"
+
+log:
+  level: debug
+  format: json

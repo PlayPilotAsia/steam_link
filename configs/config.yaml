@@ -1,0 +1,55 @@
+# 基础配置，所有环境共享。
+#
+# 敏感项与环境相关的连接地址一律留空，由 configs/{env}.env 注入
+# （见 configs/env.example）。本文件会提交到仓库，任何写在这里的
+# 密钥都等同于公开。
+#
+# 三套环境：
+#   local  本地开发，连本机 docker 的 MySQL / Redis
+#   test   本地运行，连阿里云实例（公网 IP）
+#   prod   部署在阿里云，连同一 VPC 的实例（内网 IP）
+app:
+  env: local
+
+http:
+  addr: ":8080"
+  # 站点根地址，派生出 OpenID 的两个参数：
+  #   openid.realm     = {base_url}
+  #   openid.return_to = {base_url}/auth/steam/callback?state=...
+  # Steam 会校验 return_to 落在 realm 之下（同 scheme/host/port）。
+  #
+  # 它需要「用户的浏览器」能访问，而非「Steam 的服务器」能访问 ——
+  # Steam 是用 302 把用户浏览器重定向回来的，不存在服务端回调。
+  # 因此本地开发用 localhost 完全可行，无需内网穿透。
+  base_url: "http://localhost:8080"
+
+mysql:
+  host: "127.0.0.1"     # ← STEAMLINK_MYSQL_HOST（test/prod 必填）
+  port: 3306            # ← STEAMLINK_MYSQL_PORT
+  user: "root"          # ← STEAMLINK_MYSQL_USER
+  password: ""          # ← STEAMLINK_MYSQL_PASSWORD
+  database: "steamlink" # ← STEAMLINK_MYSQL_DATABASE
+
+redis:
+  addr: "127.0.0.1:6379" # ← STEAMLINK_REDIS_ADDR（test/prod 必填）
+  password: ""           # ← STEAMLINK_REDIS_PASSWORD
+  db: 0
+
+steam:
+  api_key: ""           # ← STEAMLINK_STEAM_API_KEY
+  # 令牌桶参数。社区实测持续 1 req/s 绝对安全，突发 10+ 会触发 429，
+  # 5 req/s 是留了余量的取值。
+  rate_per_sec: 5
+  burst: 20
+
+auth:
+  state_secret: ""      # ← STEAMLINK_AUTH_STATE_SECRET
+  session_ttl: 24h
+
+worker:
+  concurrency: 4
+  poll_interval: 2s
+
+log:
+  level: info
+  format: json

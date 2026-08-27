@@ -1,0 +1,5 @@
+# local：本地开发，连本机 docker 的 MySQL / Redis。
+# 连接地址沿用基础配置的 127.0.0.1，密码由 configs/local.env 注入。
+log:
+  level: debug
+  format: text

@@ -1,0 +1,4 @@
+{"response":{"players":[
+  {"steamid":"76561197960287930","communityvisibilitystate":3,"personaname":"Player One","avatar":"https://a.example/1.jpg","personastate":1,"gameid":"440","gameextrainfo":"Team Fortress 2"},
+  {"steamid":"76561197960287931","communityvisibilitystate":3,"personaname":"Player Two","avatar":"https://a.example/2.jpg","personastate":1}
+]}}
