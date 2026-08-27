@@ -74,6 +74,40 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	reconciler := collector.NewReconciler(collector.ReconcilerDeps{
+		Steam:    sc,
+		Games:    store.NewGameRepo(db),
+		Sessions: store.NewSessionRepo(db),
+		Links:    store.NewLinkRepo(db),
+		Tasks:    queue,
+	})
+	runner.Register(task.TypeLibrarySync, reconciler.Handle)
+
+	// 启动自愈：结算 worker 宕机期间残留的僵尸会话
+	healer := collector.NewHealer(probes, queue, nil)
+	if err := healer.Run(ctx); err != nil {
+		lg.Error("启动自愈失败", slog.String("err", err.Error()))
+	}
+
+	// 每日校准调度
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		if err := reconciler.ScheduleDaily(ctx); err != nil {
+			lg.Error("每日校准调度失败", slog.String("err", err.Error()))
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := reconciler.ScheduleDaily(ctx); err != nil {
+					lg.Error("每日校准调度失败", slog.String("err", err.Error()))
+				}
+			}
+		}
+	}()
+
 	// 探针独立于任务队列，按固定节拍运行。
 	// ticker 取 30 秒而非 2 分钟：next_probe_at 才是真正的节流阀，
 	// ticker 只是驱动检查的节拍，更密的节拍能让分层中不同间隔的用户按时被采集。
