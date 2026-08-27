@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,8 +14,22 @@ import (
 // ErrMissingSecret 表示必需的敏感配置项为空。
 var ErrMissingSecret = errors.New("config: required secret is empty")
 
+// ErrUnknownEnv 表示 APP_ENV 不在允许的取值内。
+var ErrUnknownEnv = errors.New("config: unknown APP_ENV")
+
 // EnvPrefix 是环境变量前缀。steam.api_key 对应 STEAMLINK_STEAM_API_KEY。
 const EnvPrefix = "STEAMLINK"
+
+// 三套环境。取值必须白名单校验：写错一个字母时，viper 只会静默地
+// 跳过不存在的 config.{env}.yaml，服务带着一份基础配置照常启动 ——
+// 用本地地址连生产、或反过来，都是这么发生的。
+const (
+	EnvLocal = "local" // 本地开发，连本机 docker
+	EnvTest  = "test"  // 本地运行，连阿里云实例（公网 IP）
+	EnvProd  = "prod"  // 部署在阿里云，连同 VPC 实例（内网 IP）
+)
+
+var knownEnvs = map[string]bool{EnvLocal: true, EnvTest: true, EnvProd: true}
 
 type Config struct {
 	App    AppConfig    `mapstructure:"app"`
@@ -91,17 +106,27 @@ var secretBindings = map[string]string{
 	"auth.state_secret": EnvPrefix + "_AUTH_STATE_SECRET",
 }
 
-// Load 按三层优先级加载配置：
+// Load 按四层优先级加载配置：
 //
 //	configs/config.yaml        基础值
 //	configs/config.{env}.yaml  环境覆盖
-//	STEAMLINK_* 环境变量        最高优先级
+//	configs/{env}.env          本机注入的地址与密钥（不进仓库）
+//	真实环境变量                最高优先级
 //
-// env 取自 APP_ENV，缺省为 dev。
+// env 取自 APP_ENV，缺省为 local。
 func Load(dir string) (Config, error) {
 	env := os.Getenv("APP_ENV")
 	if env == "" {
-		env = "dev"
+		env = EnvLocal
+	}
+	if !knownEnvs[env] {
+		return Config{}, fmt.Errorf("%w: %q（可选：%s / %s / %s）",
+			ErrUnknownEnv, env, EnvLocal, EnvTest, EnvProd)
+	}
+
+	fileVars, err := readEnvFile(filepath.Join(dir, env+".env"))
+	if err != nil {
+		return Config{}, err
 	}
 
 	v := viper.New()
@@ -130,6 +155,10 @@ func Load(dir string) (Config, error) {
 			return Config{}, err
 		}
 	}
+
+	// .env 的优先级介于 YAML 与真实环境变量之间，必须在两个 YAML
+	// 都读完之后再注入，否则会被 MergeInConfig 覆盖。
+	applyEnvFile(v, fileVars)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -161,7 +190,7 @@ func (c Config) validate() error {
 		}
 	}
 
-	if c.App.Env == "prod" {
+	if c.App.Env == EnvProd {
 		if c.HTTP.BaseURL == "" {
 			return fmt.Errorf("config: prod 环境必须设置 %s_HTTP_BASE_URL", EnvPrefix)
 		}

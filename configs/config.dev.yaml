@@ -1,7 +1,0 @@
-mysql:
-  # 本机常驻开发容器 dev-mysql 的固定 root 密码，不构成泄漏。
-  password: "localdev-root"
-
-log:
-  level: debug
-  format: text

@@ -1,7 +1,15 @@
-# 敏感项一律留空，由 STEAMLINK_* 环境变量注入。
-# 本文件会提交到仓库，任何写在这里的密钥都等同于公开。
+# 基础配置，所有环境共享。
+#
+# 敏感项与环境相关的连接地址一律留空，由 configs/{env}.env 注入
+# （见 configs/env.example）。本文件会提交到仓库，任何写在这里的
+# 密钥都等同于公开。
+#
+# 三套环境：
+#   local  本地开发，连本机 docker 的 MySQL / Redis
+#   test   本地运行，连阿里云实例（公网 IP）
+#   prod   部署在阿里云，连同一 VPC 的实例（内网 IP）
 app:
-  env: dev
+  env: local
 
 http:
   addr: ":8080"
@@ -16,15 +24,15 @@ http:
   base_url: "http://localhost:8080"
 
 mysql:
-  host: "127.0.0.1"
-  port: 3306
-  user: "root"
+  host: "127.0.0.1"     # ← STEAMLINK_MYSQL_HOST（test/prod 必填）
+  port: 3306            # ← STEAMLINK_MYSQL_PORT
+  user: "root"          # ← STEAMLINK_MYSQL_USER
   password: ""          # ← STEAMLINK_MYSQL_PASSWORD
-  database: "steamlink"
+  database: "steamlink" # ← STEAMLINK_MYSQL_DATABASE
 
 redis:
-  addr: "127.0.0.1:6379"
-  password: ""
+  addr: "127.0.0.1:6379" # ← STEAMLINK_REDIS_ADDR（test/prod 必填）
+  password: ""           # ← STEAMLINK_REDIS_PASSWORD
   db: 0
 
 steam:

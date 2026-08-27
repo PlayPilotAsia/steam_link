@@ -1,5 +1,8 @@
+# prod：部署在阿里云，连同一 VPC 内的实例（内网 IP）。
+#
 # base_url 刻意留空：生产域名必须由 STEAMLINK_HTTP_BASE_URL 显式提供。
 # 若沿用默认的 localhost，OpenID 回调会静默失败且难以排查。
+# 内网地址与密码由 configs/prod.env 注入。
 http:
   base_url: ""
 
