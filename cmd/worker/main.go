@@ -70,18 +70,22 @@ func main() {
 		Sessions: sessionRepo,
 		Tasks:    queue,
 	})
-	runner.Register(task.TypeSessionSettle, settler.Handle)
+	guard := collector.NewRedisQuotaGuard(limiter)
+	runner.Register(task.TypeSessionSettle,
+		collector.WithQuotaGuard(guard, task.PriorityNormal, settler.Handle))
 
 	schemaSyncer := collector.NewSchemaSyncer(collector.SchemaDeps{
 		Steam: sc, Games: gameRepo, Tasks: queue,
 	})
-	runner.Register(task.TypeSchemaSync, schemaSyncer.Handle)
+	runner.Register(task.TypeSchemaSync,
+		collector.WithQuotaGuard(guard, task.PriorityNormal, schemaSyncer.Handle))
 
 	achSyncer := collector.NewAchievementSyncer(collector.AchievementDeps{
 		Steam: sc, Games: gameRepo, Sessions: sessionRepo,
 		Links: linkRepo, Tasks: queue,
 	})
-	runner.Register(task.TypeAchievementSync, achSyncer.Handle)
+	runner.Register(task.TypeAchievementSync,
+		collector.WithQuotaGuard(guard, task.PriorityNormal, achSyncer.Handle))
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
@@ -94,7 +98,8 @@ func main() {
 		Links:    linkRepo,
 		Tasks:    queue,
 	})
-	runner.Register(task.TypeLibrarySync, reconciler.Handle)
+	runner.Register(task.TypeLibrarySync,
+		collector.WithQuotaGuard(guard, task.PriorityNormal, reconciler.Handle))
 
 	// 启动自愈：结算 worker 宕机期间残留的僵尸会话
 	healer := collector.NewHealer(probes, queue, nil)

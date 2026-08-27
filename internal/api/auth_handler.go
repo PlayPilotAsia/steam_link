@@ -19,7 +19,7 @@ import (
 // SessionCookieName 是承载本站登录态的 Cookie 名。
 //
 // 必须用 Cookie 而非 Authorization 头：OpenID 流程包含两次浏览器顶层导航
-//（本站 → Steam、Steam → 本站），顶层导航无法携带自定义请求头，
+// （本站 → Steam、Steam → 本站），顶层导航无法携带自定义请求头，
 // 用 fetch 又会撞上跨域重定向。Cookie 是唯一能贯穿整个流程的载体。
 const SessionCookieName = "steamlink_session"
 

@@ -17,7 +17,7 @@ const PrivateStrikeLimit int8 = 3
 //
 // 只在确认无成就时短路。其余情况一律入队 TypeAchievementSync 而非
 // TypeSchemaSync —— 后者若不带 SteamID，SchemaSyncer 拉完定义就到此为止
-//（它靠 t.SteamID == 0 判断是否要链回成就同步），用户的解锁状态永远拉不到。
+// （它靠 t.SteamID == 0 判断是否要链回成就同步），用户的解锁状态永远拉不到。
 //
 // AchievementSyncer 自身已内建「schema 缺失 → 带 SteamID 入队 SchemaSync →
 // SchemaSync 链回 AchievementSync」的完整路径，把入口收敛到它这里最可靠。

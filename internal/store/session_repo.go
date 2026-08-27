@@ -33,7 +33,7 @@ func (r *SessionRepo) Insert(ctx context.Context, s PlaySession) (bool, error) {
 // SetPlaytime 写入用户某款游戏的累计时长与最后游玩时刻。
 //
 // 必须是 upsert 而非纯 UPDATE。用户当天新购的游戏在 user_games 里还没有行
-//（要等次日 L3 校准才 upsert 进来），纯 UPDATE 会影响 0 行且不报错，
+// （要等次日 L3 校准才 upsert 进来），纯 UPDATE 会影响 0 行且不报错，
 // 导致下一次结算读到的 prev 仍是 0：
 //
 //	玩 30 分钟 → delta = 30-0 = 30，写会话，SetPlaytime 静默失败
