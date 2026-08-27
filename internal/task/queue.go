@@ -173,3 +173,71 @@ func truncate(s string, n int) string {
 	}
 	return s[:n]
 }
+
+// Claim 领取到期任务。
+//
+// 设计要点：统一使用 next_run_at 作为唯一的调度时间轴。领取时把 status 置为
+// StatusRunning 并把 next_run_at 推到租约到期时刻，因此扫描条件不需要 OR：
+//
+//	status=0/3 且到期 → 正常待执行
+//	status=1   且到期 → 租约已过期，持有它的 worker 已崩溃，自动回收
+//
+// FOR UPDATE SKIP LOCKED 保证多 worker 并发扫描互不阻塞、互不重复。
+func (q *MySQLQueue) Claim(ctx context.Context, limit int, lease time.Duration) ([]Task, error) {
+	now := q.nowFunc()
+	var out []Task
+
+	err := q.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var rows []store.SyncTask
+		if err := tx.Clauses(clause.Locking{
+			Strength: "UPDATE",
+			Options:  "SKIP LOCKED",
+		}).
+			Where("status IN ? AND next_run_at <= ?",
+				[]int8{StatusPending, StatusRunning, StatusRetrying}, now).
+			Order("priority, next_run_at").
+			Limit(limit).
+			Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+
+		ids := make([]uint64, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+
+		// 续租：状态置为执行中，next_run_at 推到租约到期时刻
+		if err := tx.Model(&store.SyncTask{}).
+			Where("id IN ?", ids).
+			Updates(map[string]any{
+				"status":      StatusRunning,
+				"next_run_at": now.Add(lease),
+				"updated_at":  now,
+			}).Error; err != nil {
+			return err
+		}
+
+		for _, r := range rows {
+			out = append(out, Task{
+				ID:        r.ID,
+				Type:      r.Type,
+				SteamID:   r.SteamID,
+				AppID:     r.AppID,
+				Payload:   r.Payload,
+				Priority:  r.Priority,
+				Status:    StatusRunning,
+				Attempts:  r.Attempts,
+				NextRunAt: now.Add(lease),
+				LastError: r.LastError,
+			})
+		}
+		return nil
+	})
+
+	return out, err
+}
+
+var _ Queue = (*MySQLQueue)(nil)
