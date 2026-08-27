@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
@@ -138,4 +139,18 @@ func (r *GameRepo) ListLibrary(ctx context.Context, steamID uint64) ([]LibraryRo
 		Order("ug.playtime_forever_min DESC, ug.appid").
 		Scan(&rows).Error
 	return rows, err
+}
+
+// HasAchievements 返回 apps.has_achievements：-1 未知、0 无成就、1 有成就。
+// 游戏不存在时返回 -1。
+func (r *GameRepo) HasAchievements(ctx context.Context, appID uint32) (int8, error) {
+	var v int8
+	err := r.db.WithContext(ctx).Model(&App{}).
+		Select("has_achievements").
+		Where("appid = ?", appID).
+		Take(&v).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return -1, nil
+	}
+	return v, err
 }

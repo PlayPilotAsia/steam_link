@@ -61,7 +61,14 @@ func main() {
 		PollInterval: cfg.Worker.PollInterval,
 		Logger:       lg,
 	})
-	// handler 在 Task 13、14、15、16 中逐步注册
+	settler := collector.NewSettler(collector.SettlerDeps{
+		Steam:    sc,
+		Games:    store.NewGameRepo(db),
+		Sessions: store.NewSessionRepo(db),
+		Tasks:    queue,
+	})
+	runner.Register(task.TypeSessionSettle, settler.Handle)
+	// 其余 handler 在 Task 14、15、16 中逐步注册
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
