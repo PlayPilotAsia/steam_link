@@ -1,5 +1,28 @@
 # Steam 账号关联与游戏数据采集 · 实施计划
 
+> ## ✅ 已实施完毕（2026-08-27）
+>
+> Task 1 ~ Task 20 全部完成并通过测试，本文档就此**冻结为历史留痕**：
+> 它记录的是「当初打算怎么做」，不是「现在代码是什么样」。
+>
+> **后续代码变更不再回写本文档。** 要了解当前实现，请直接读代码与
+> `docs/01-design.md`；两者冲突时以代码为准。
+>
+> 实施过程中与本计划的已知偏离（均已在代码中生效）：
+>
+> | 计划原文 | 实际实现 | 原因 |
+> |---|---|---|
+> | Gin 最新版 | gin v1.11.0 | v1.12 要求 go ≥ 1.25，会顶掉 Go 1.24 的约束 |
+> | `configs/config.dev.yaml` 两套环境 | `local` / `test` / `prod` 三套 + `configs/{env}.env` | 本地 docker、本地连阿里云、阿里云部署三种场景；密钥与实例地址不进仓库 |
+> | `APP_ENV` 缺省 `dev` | 缺省 `local`，且做白名单校验 | 环境名写错时 viper 会静默沿用基础配置，等于拿本地地址连生产 |
+> | docker compose 起 MySQL/Redis | 复用本机常驻的 `dev-mysql` / `dev-redis` | 3306/6379 已被占用；compose 保留为无现成容器时的回退 |
+> | `go test ./...` | `go test -p 1 ./...` | store / task / collector / e2e 共用同一个库并会清表，并行会互相清掉数据 |
+> | Task 6 的 `api.Deps` 一次给全 | `Probes` 在 Task 11、`Sessions`/`Tasks` 在 Task 17 才加入 | 对应仓储与队列类型在后续任务才存在 |
+>
+> 未达成的计划目标：`internal/domain` 覆盖率 100% ✅，但 `internal/api`（5.8%）、
+> `internal/store`（61%）、`internal/steam`（65.6%）低于「其余包不低于 70%」的期望 ——
+> 计划本身未为这些包安排更多用例。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 构建一个 Go 服务，让用户通过 Steam OpenID 绑定账号，并持续采集其游戏库、全库成就与带起止时刻的游戏会话事件流。
