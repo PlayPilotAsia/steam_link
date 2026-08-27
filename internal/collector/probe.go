@@ -18,9 +18,6 @@ import (
 // Steam 的 playtime_forever 在游戏退出后才最终结算，立刻查询会拿到旧值。
 const SettleDelay = 5 * time.Minute
 
-// DefaultProbeInterval 是探针的基础间隔。分层调整在 Task 18 引入。
-const DefaultProbeInterval = 2 * time.Minute
-
 // maxDuePerRun 限制单轮取出的用户数，避免一次拉取过多。
 const maxDuePerRun = 1000
 
@@ -125,16 +122,42 @@ func (p *Prober) advanceOne(ctx context.Context, row store.ProbeState,
 	next, events := domain.Advance(prev, domain.Probe{GameID: gameID}, now)
 
 	for _, e := range events {
-		if e.Kind != domain.SessionEnded {
-			continue // 会话开始无需任何后续动作
+		if e.Kind == domain.SessionStarted {
+			p.lg.Info("会话开始",
+				logging.SteamID(row.SteamID),
+				slog.Uint64("appid", uint64(e.AppID)))
+			continue
 		}
+
+		p.lg.Info("会话结束，入队结算",
+			logging.SteamID(row.SteamID),
+			slog.Uint64("appid", uint64(e.AppID)),
+			slog.Time("started_at", e.StartedAt),
+			slog.Time("ended_at", e.EndedAt))
+
 		if err := p.enqueueSettle(ctx, row.SteamID, e, now); err != nil {
 			return err
 		}
 	}
 
-	nextAt := now.Add(DefaultProbeInterval)
-	return p.d.Probes.Save(ctx, row.SteamID, next, row.Tier, nextAt, now)
+	// 用最后一次游玩时刻重新分层。正在游玩时以当前时刻计，
+	// 保证其落入 TierActive。
+	lastPlayed := lastPlayedOf(row, next, now)
+	tier := domain.ClassifyTier(lastPlayed, now)
+	nextAt := domain.NextProbeAt(tier, next.AppID != 0, now)
+
+	return p.d.Probes.Save(ctx, row.SteamID, next, int8(tier), nextAt, now)
+}
+
+// lastPlayedOf 推断用于分层的「最后游玩时刻」。
+func lastPlayedOf(row store.ProbeState, next domain.State, now time.Time) time.Time {
+	if next.AppID != 0 {
+		return now // 正在游玩
+	}
+	if row.LastSeenPlayingAt != nil {
+		return *row.LastSeenPlayingAt
+	}
+	return time.Time{}
 }
 
 func (p *Prober) enqueueSettle(ctx context.Context, steamID uint64,

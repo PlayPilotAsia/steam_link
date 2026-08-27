@@ -180,3 +180,24 @@ func (s *partialSteam) GetPlayerSummaries(_ context.Context, ids []uint64) ([]st
 	}
 	return out, nil
 }
+
+// 沉睡用户一旦开始游玩，必须立刻升到最高探测频率。
+func TestProber_PlayingUserUpgradesToActiveTier(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	pr, q, _ := newProbeFixture(t, now, 1)
+	ctx := context.Background()
+
+	// 预置一个沉睡用户
+	require.NoError(t, pr.Save(ctx, 1, domain.State{}, int8(domain.TierAsleep),
+		now, now))
+
+	st := &stubSteam{results: map[uint64]uint32{1: 440}}
+	p := NewProber(ProberDeps{Steam: st, Probes: pr, Tasks: q,
+		Now: func() time.Time { return now }})
+	require.NoError(t, p.RunOnce(ctx))
+
+	due, err := pr.Due(ctx, now.Add(3*time.Minute), 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1, "开始游玩后应在 2 分钟内再次到期")
+	require.Equal(t, int8(domain.TierActive), due[0].Tier)
+}
