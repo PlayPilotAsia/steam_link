@@ -1,0 +1,4 @@
+{"response":{"game_count":2,"games":[
+  {"appid":620,"name":"Portal 2 🧪","playtime_forever":1234,"playtime_2weeks":60,"img_icon_url":"abc123","rtime_last_played":1756180800},
+  {"appid":730,"name":"反恐精英：全球攻势 ⚡","playtime_forever":5000,"img_icon_url":"def456","rtime_last_played":0}
+]}}
