@@ -51,6 +51,7 @@ func NewRouter(d Deps) *gin.Engine {
 	{
 		api.POST("/link/recheck", d.handleRecheck)
 		api.DELETE("/link", d.handleUnlink)
+		api.GET("/library", d.handleLibrary)
 	}
 	return r
 }

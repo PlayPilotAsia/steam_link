@@ -111,3 +111,31 @@ func (r *GameRepo) PlaytimeMap(ctx context.Context, steamID uint64) (map[uint32]
 	}
 	return m, nil
 }
+
+// LibraryRow 是 user_games 联 apps 后的展示行。
+type LibraryRow struct {
+	AppID              uint32     `gorm:"column:appid"`
+	Name               string     `gorm:"column:name"`
+	ImgIconURL         string     `gorm:"column:img_icon_url"`
+	PlaytimeForeverMin uint32     `gorm:"column:playtime_forever_min"`
+	Playtime2WeeksMin  uint32     `gorm:"column:playtime_2weeks_min"`
+	RtimeLastPlayed    *time.Time `gorm:"column:rtime_last_played"`
+	AchUnlocked        uint16     `gorm:"column:ach_unlocked"`
+	AchTotal           uint16     `gorm:"column:ach_total"`
+}
+
+// ListLibrary 返回按累计时长倒序的游戏库。
+// 名称与图标存在全局的 apps 表中，此处联表取出。
+func (r *GameRepo) ListLibrary(ctx context.Context, steamID uint64) ([]LibraryRow, error) {
+	var rows []LibraryRow
+	err := r.db.WithContext(ctx).
+		Table("user_games AS ug").
+		Select(`ug.appid, a.name, a.img_icon_url,
+		        ug.playtime_forever_min, ug.playtime_2weeks_min,
+		        ug.rtime_last_played, ug.ach_unlocked, ug.ach_total`).
+		Joins("LEFT JOIN apps AS a ON a.appid = ug.appid").
+		Where("ug.steam_id64 = ?", steamID).
+		Order("ug.playtime_forever_min DESC, ug.appid").
+		Scan(&rows).Error
+	return rows, err
+}

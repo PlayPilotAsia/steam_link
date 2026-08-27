@@ -74,3 +74,26 @@ func TestGameRepo_PlaytimeMap(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, map[uint32]uint32{620: 100, 730: 5000}, m)
 }
+
+// 游戏库列表需要联 apps 表拿名称与图标 —— user_games 本身不存这些。
+func TestGameRepo_ListLibraryJoinsAppMetadata(t *testing.T) {
+	r := NewGameRepo(testDB(t))
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	require.NoError(t, r.UpsertApps(ctx, sampleGames()))
+	require.NoError(t, r.UpsertUserGames(ctx, 76561197960287930, sampleGames(), now))
+
+	rows, err := r.ListLibrary(ctx, 76561197960287930)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+
+	// 按累计时长倒序：730 有 5000 分钟，620 有 100 分钟
+	require.Equal(t, uint32(730), rows[0].AppID)
+	require.Equal(t, "反恐精英 ⚡", rows[0].Name)
+	require.Equal(t, uint32(5000), rows[0].PlaytimeForeverMin)
+
+	require.Equal(t, uint32(620), rows[1].AppID)
+	require.Equal(t, "abc", rows[1].ImgIconURL)
+	require.NotNil(t, rows[1].RtimeLastPlayed)
+}
