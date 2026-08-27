@@ -154,3 +154,94 @@ func (r *GameRepo) HasAchievements(ctx context.Context, appID uint32) (int8, err
 	}
 	return v, err
 }
+
+// UpsertAchievementSchema 写入某款游戏的成就定义。
+// 这张表不带用户维度：1000 个用户共玩 5000 款游戏，成就定义只需拉 5000 次。
+func (r *GameRepo) UpsertAchievementSchema(ctx context.Context, appID uint32,
+	achs []steam.SchemaAchievement, now time.Time) error {
+
+	if len(achs) == 0 {
+		return nil
+	}
+
+	rows := make([]AppAchievement, 0, len(achs))
+	for _, a := range achs {
+		var hidden int8
+		if a.Hidden {
+			hidden = 1
+		}
+		rows = append(rows, AppAchievement{
+			AppID:       appID,
+			APIName:     a.APIName,
+			DisplayName: a.DisplayName,
+			Description: a.Description,
+			Icon:        a.Icon,
+			IconGray:    a.IconGray,
+			Hidden:      hidden,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		})
+	}
+
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "appid"}, {Name: "api_name"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"display_name", "description", "icon", "icon_gray", "hidden", "updated_at",
+		}),
+	}).CreateInBatches(&rows, upsertBatchSize).Error
+}
+
+// MarkAppAchievements 标记某款游戏是否有成就系统及成就总数。
+//
+// 必须是 upsert：新购游戏可能在 L3 校准把它写进 apps 表之前，
+// 就被 L1 结算触发了成就同步。此时纯 UPDATE 影响 0 行且不报错，
+// has_achievements 永远停留在「无行 → -1」，于是每次游玩都重新
+// 入队一次 SchemaSync，每次白烧一回 GetSchemaForGame —— 正是
+// 设计 §6.5 警告的「陷入死循环并持续消耗配额」。
+func (r *GameRepo) MarkAppAchievements(ctx context.Context, appID uint32,
+	has int8, total uint16, now time.Time) error {
+
+	row := App{
+		AppID:           appID,
+		HasAchievements: has,
+		AchTotal:        total,
+		SchemaSyncedAt:  &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "appid"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"has_achievements", "ach_total", "schema_synced_at", "updated_at",
+		}),
+	}).Create(&row).Error
+}
+
+func (r *GameRepo) SchemaAchievementCount(ctx context.Context, appID uint32) (int64, error) {
+	var n int64
+	err := r.db.WithContext(ctx).Model(&AppAchievement{}).
+		Where("appid = ?", appID).Count(&n).Error
+	return n, err
+}
+
+// UpdateGlobalPercentages 批量回填成就的全球解锁率。
+// 只更新已存在的定义行，不新增 —— 定义由 UpsertAchievementSchema 负责。
+func (r *GameRepo) UpdateGlobalPercentages(ctx context.Context, appID uint32,
+	pcts map[string]float64, now time.Time) error {
+
+	if len(pcts) == 0 {
+		return nil
+	}
+
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for name, pct := range pcts {
+			if err := tx.Model(&AppAchievement{}).
+				Where("appid = ? AND api_name = ?", appID, name).
+				Updates(map[string]any{"global_pct": pct, "updated_at": now}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}

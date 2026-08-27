@@ -3,6 +3,7 @@ package steam
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,4 +83,24 @@ func TestRateLimitedMapsToSentinel(t *testing.T) {
 
 	_, err := c.GetOwnedGames(context.Background(), 76561197960287930)
 	require.ErrorIs(t, err, ErrRateLimited)
+}
+
+func TestGetGlobalAchievementPercentages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 该接口不需要 key，且参数名是 gameid 而非 appid
+		require.Equal(t, "440", r.URL.Query().Get("gameid"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"achievementpercentages":{"achievements":[
+			{"name":"ACH_A","percent":42.5},
+			{"name":"ACH_B","percent":3.125}
+		]}}`)
+	}))
+	defer srv.Close()
+
+	c := New("testkey", WithBaseURL(srv.URL))
+	got, err := c.GetGlobalAchievementPercentages(context.Background(), 440)
+
+	require.NoError(t, err)
+	require.InDelta(t, 42.5, got["ACH_A"], 0.001)
+	require.InDelta(t, 3.125, got["ACH_B"], 0.001)
 }

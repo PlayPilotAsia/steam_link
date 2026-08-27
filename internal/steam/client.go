@@ -292,3 +292,34 @@ func (c *HTTPClient) GetSchemaForGame(ctx context.Context, appID uint32) (GameSc
 
 // 编译期断言：HTTPClient 必须满足 Client 接口
 var _ Client = (*HTTPClient)(nil)
+
+type rawGlobalPct struct {
+	AchievementPercentages struct {
+		Achievements []struct {
+			Name    string  `json:"name"`
+			Percent float64 `json:"percent"`
+		} `json:"achievements"`
+	} `json:"achievementpercentages"`
+}
+
+// GetGlobalAchievementPercentages 返回 apiname → 全球解锁百分比。
+//
+// 注意两个与其他接口不同之处：参数名是 gameid 而非 appid，
+// 且该接口本身不需要 API Key（getJSON 仍会带上，无害）。
+func (c *HTTPClient) GetGlobalAchievementPercentages(ctx context.Context,
+	appID uint32) (map[string]float64, error) {
+
+	q := url.Values{"gameid": {strconv.FormatUint(uint64(appID), 10)}}
+
+	var raw rawGlobalPct
+	if err := c.getJSON(ctx,
+		"/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/", q, &raw); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]float64, len(raw.AchievementPercentages.Achievements))
+	for _, a := range raw.AchievementPercentages.Achievements {
+		out[a.Name] = a.Percent
+	}
+	return out, nil
+}

@@ -52,4 +52,5 @@ type Client interface {
 	GetRecentlyPlayedGames(ctx context.Context, id uint64) ([]OwnedGame, error)
 	GetPlayerAchievements(ctx context.Context, id uint64, appID uint32) ([]PlayerAchievement, error)
 	GetSchemaForGame(ctx context.Context, appID uint32) (GameSchema, error)
+	GetGlobalAchievementPercentages(ctx context.Context, appID uint32) (map[string]float64, error)
 }
