@@ -6,7 +6,7 @@
 # base_url 仍是 localhost：服务跑在本机，Steam 是用 302 把「用户浏览器」
 # 重定向回来的，不需要公网可达。
 http:
-  base_url: "http://localhost:8080"
+  base_url: "http://localhost:9994"
 
 log:
   level: debug

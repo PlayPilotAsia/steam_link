@@ -27,7 +27,7 @@ func TestLoad_MergesBaseAndEnvFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// 来自基础配置
-	require.Equal(t, ":8080", cfg.HTTP.Addr)
+	require.Equal(t, ":9994", cfg.HTTP.Addr)
 	require.Equal(t, 3306, cfg.MySQL.Port)
 	require.Equal(t, 5, cfg.Steam.RatePerSec)
 	// 被 local 覆盖
@@ -104,7 +104,7 @@ func TestLoad_TestEnvKeepsLocalBaseURL(t *testing.T) {
 	cfg, err := Load(testConfigDir)
 	require.NoError(t, err)
 	require.Equal(t, EnvTest, cfg.App.Env)
-	require.Equal(t, "http://localhost:8080", cfg.HTTP.BaseURL)
+	require.Equal(t, "http://localhost:9994", cfg.HTTP.BaseURL)
 }
 
 // APP_ENV 写错时必须启动即失败。若放任不管，viper 只会静默跳过

@@ -12,7 +12,7 @@ app:
   env: local
 
 http:
-  addr: ":8080"
+  addr: ":9994"
   # 站点根地址，派生出 OpenID 的两个参数：
   #   openid.realm     = {base_url}
   #   openid.return_to = {base_url}/auth/steam/callback?state=...
@@ -21,7 +21,7 @@ http:
   # 它需要「用户的浏览器」能访问，而非「Steam 的服务器」能访问 ——
   # Steam 是用 302 把用户浏览器重定向回来的，不存在服务端回调。
   # 因此本地开发用 localhost 完全可行，无需内网穿透。
-  base_url: "http://localhost:8080"
+  base_url: "http://localhost:9994"
 
 mysql:
   host: "127.0.0.1"     # ← STEAMLINK_MYSQL_HOST（test/prod 必填）
