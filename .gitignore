@@ -31,8 +31,11 @@ go.work.sum
 # 防御性忽略旧位置；正式共享文件位于工作空间 deploy/demo/env/。
 configs/*.env
 
-# Editor/IDE
-.idea/
-.vscode/
+### IDE ###
+.idea
+*.iws
+*.iml
+*.ipr
+.vscode
 
 *.DS_Store

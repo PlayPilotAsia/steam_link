@@ -2,25 +2,21 @@ package collector
 
 import (
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
 	"github.com/PlayPilotAsia/steam_link/internal/store"
+	"github.com/PlayPilotAsia/steam_link/internal/testsupport"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func storeTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := os.Getenv("TEST_MYSQL_DSN")
-	if dsn == "" {
-		dsn = "root:localdev-root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
-	}
-	db, err := store.NewDB(dsn, testLogger())
-	require.NoError(t, err, "需要本地 MySQL 并已初始化：./scripts/dev/up.sh")
+	db, err := store.NewDB(testsupport.DSN(t), testLogger())
+	require.NoError(t, err)
 
 	for _, tbl := range []string{
 		"sync_tasks", "probe_state", "achievement_unlocks",

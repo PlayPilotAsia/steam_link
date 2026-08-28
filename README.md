@@ -136,7 +136,22 @@ go run ./cmd/worker    # 采集进程
 ```
 
 `up.sh` 默认复用本机常驻的 `dev-mysql` / `dev-redis` 容器；找不到时回退到本仓库的 `docker-compose.yml`。
-集成测试打的是真实 MySQL —— `SKIP LOCKED`、生成列、`ON DUPLICATE KEY UPDATE` 的行为在 SQLite 上完全不同，用它测等于没测。测试库地址可用 `TEST_MYSQL_DSN` 覆盖。
+
+### 测试库
+
+集成测试打的是真实 MySQL —— `SKIP LOCKED`、生成列、`ON DUPLICATE KEY UPDATE` 的行为在 SQLite 上完全不同，用它测等于没测。
+
+`go test ./...` 直接跑即可，不需要 `-p 1`。**每个测试包用自己的库**：`internal/testsupport` 在包路径派生的库名上建库并应用 `scripts/db/init.sql` 与 `scripts/db/migrations/*.sql`，于是 `internal/store` 用 `steamlink_internal_store`、`internal/e2e` 用 `steamlink_internal_e2e`，依此类推。这些包的用例会在每个用例前清表，共用一个库的话 Go 默认的跨包并行就会让它们互相清掉对方的数据。
+
+因此测试**不碰** `up.sh` 建的 `steamlink` 开发库，也不要求先跑 `up.sh` 建表 —— 只要 MySQL 在跑，测试库会自己建出来。服务器地址与库名前缀用 `TEST_MYSQL_DSN` 覆盖（后缀照样追加，`.../mydb` → `mydb_internal_store`）：
+
+```bash
+TEST_MYSQL_DSN='root:pw@tcp(127.0.0.1:3306)/mydb?parseTime=true&loc=UTC&charset=utf8mb4' go test ./...
+```
+
+`parseTime=true` 与 `loc=UTC` 是必须的，否则 `DATETIME` 扫描进 `time.Time` 会失败或带错时区。
+
+Redis 侧已按 DB 序号隔开（`internal/auth` 用 14、`internal/steam` 用 15），无需额外配置。
 
 要求 **Go 1.24+**、**MySQL 8.0.1+**（低于此版本 `SELECT ... FOR UPDATE SKIP LOCKED` 不可用，整个任务表方案失效）。
 

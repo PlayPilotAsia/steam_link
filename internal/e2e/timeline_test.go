@@ -3,7 +3,6 @@ package e2e
 import (
 	"context"
 	"log/slog"
-	"os"
 	"testing"
 	"time"
 
@@ -14,17 +13,14 @@ import (
 	"github.com/PlayPilotAsia/steam_link/internal/steam"
 	"github.com/PlayPilotAsia/steam_link/internal/store"
 	"github.com/PlayPilotAsia/steam_link/internal/task"
+	"github.com/PlayPilotAsia/steam_link/internal/testsupport"
 )
 
 const testSteamID uint64 = 76561197960287930
 
 func e2eDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := os.Getenv("TEST_MYSQL_DSN")
-	if dsn == "" {
-		dsn = "root:localdev-root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
-	}
-	db, err := store.NewDB(dsn, slog.New(slog.DiscardHandler))
+	db, err := store.NewDB(testsupport.DSN(t), slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	for _, tbl := range []string{

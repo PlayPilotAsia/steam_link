@@ -2,31 +2,22 @@ package store
 
 import (
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
-)
 
-// testDSN 指向本地开发用的 MySQL（默认复用常驻容器 dev-mysql）。
-// 必须带 parseTime=true 与 loc=UTC，否则 DATETIME 扫描进 time.Time 会失败或带错时区。
-func testDSN() string {
-	if v := os.Getenv("TEST_MYSQL_DSN"); v != "" {
-		return v
-	}
-	return "root:localdev-root@tcp(127.0.0.1:3306)/steamlink?parseTime=true&loc=UTC&charset=utf8mb4"
-}
+	"github.com/PlayPilotAsia/steam_link/internal/testsupport"
+)
 
 // testLogger 静默日志输出，避免测试被 SQL trace 淹没。
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func testDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := NewDB(testDSN(), testLogger())
-	require.NoError(t, err, "需要本地 MySQL 且已初始化：./scripts/dev/up.sh")
+	db := testDBHandle(t)
 
-	// 每个用例前清空，保证互不干扰
+	// 每个用例前清空，保证互不干扰。跨包的隔离由 testsupport 的独立库负责。
 	for _, tbl := range []string{
 		"sync_tasks", "probe_state", "achievement_unlocks",
 		"play_sessions", "user_games", "app_achievements", "apps", "steam_links",
@@ -38,7 +29,7 @@ func testDB(t *testing.T) *gorm.DB {
 
 func testDBHandle(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := NewDB(testDSN(), testLogger())
+	db, err := NewDB(testsupport.DSN(t), testLogger())
 	require.NoError(t, err)
 	return db
 }
