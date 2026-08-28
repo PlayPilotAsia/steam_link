@@ -210,22 +210,23 @@ Redis 承担四项职责，全部可在丢失后重建：
 
 ### 4.6 配置管理
 
-配置采用「基础 YAML + 环境覆盖 + 环境变量兜底」三层结构，由 viper 按顺序合并：
+配置采用「基础 YAML + 环境覆盖 + 共享 env + 环境变量」四层结构，由 viper 按顺序合并：
 
 ```
 configs/config.yaml          ← 基础值，所有环境共享
 configs/config.{env}.yaml    ← 环境差异项，覆盖基础值
-环境变量 STEAMLINK_*          ← 最高优先级，覆盖前两者
+deploy/demo/env/{env}.env    ← 跨服务连接信息与服务私有密钥，不进 Git
+真实进程环境变量               ← 最高优先级
 ```
 
-环境由 `APP_ENV` 选择（默认 `dev`）。
+环境由 `APP_ENV` 选择（默认 `local`）。共享目录可通过 `PLAYPILOT_CONFIG_DIR` 覆盖。
 
 **敏感项一律不写入 YAML。** `steam.api_key`、`mysql.password`、`auth.state_secret` 三项在 YAML 中留空，由环境变量在部署时注入：
 
 | 配置键 | 对应环境变量 |
 |---|---|
 | `steam.api_key` | `STEAMLINK_STEAM_API_KEY` |
-| `mysql.password` | `STEAMLINK_MYSQL_PASSWORD` |
+| `mysql.password` | `PLAYPILOT_MYSQL_PASSWORD` |
 | `auth.state_secret` | `STEAMLINK_AUTH_STATE_SECRET` |
 
 原因很实际：`configs/` 目录会被提交到仓库，Steam API Key 一旦泄漏，攻击者可以用它耗尽你的日配额；`state_secret` 泄漏则可以伪造 CSRF state，诱导受害者把 Steam 账号绑定到攻击者的本站账号上。

@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-// readEnvFile 解析 configs/{env}.env，返回 环境变量名 → 值。
+// readEnvFile 解析共享配置目录中的 {env}.env，返回 环境变量名 → 值。
 //
 // 刻意不调用 os.Setenv：那会永久改写进程环境，让 Load 变成有副作用、
 // 且依赖调用顺序的函数 —— 同一进程里先后加载两套环境时，前一套的地址
@@ -43,7 +43,7 @@ func readEnvFile(path string) (map[string]string, error) {
 }
 
 // parseEnvLine 解析一行 KEY=VALUE。ok 为 false 表示该行应被跳过
-//（空行或注释）；ok 为 true 但 key 为空表示格式非法。
+// （空行或注释）；ok 为 true 但 key 为空表示格式非法。
 func parseEnvLine(raw string) (key, val string, ok bool) {
 	s := strings.TrimSpace(raw)
 	if s == "" || strings.HasPrefix(s, "#") {
@@ -80,7 +80,7 @@ func applyEnvFile(v *viper.Viper, fileVars map[string]string) {
 	}
 
 	for _, key := range v.AllKeys() {
-		envName := EnvPrefix + "_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+		envName := envNameForKey(key)
 		if _, inRealEnv := os.LookupEnv(envName); inRealEnv {
 			continue
 		}

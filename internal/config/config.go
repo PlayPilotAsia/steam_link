@@ -17,8 +17,12 @@ var ErrMissingSecret = errors.New("config: required secret is empty")
 // ErrUnknownEnv 表示 APP_ENV 不在允许的取值内。
 var ErrUnknownEnv = errors.New("config: unknown APP_ENV")
 
-// EnvPrefix 是环境变量前缀。steam.api_key 对应 STEAMLINK_STEAM_API_KEY。
-const EnvPrefix = "STEAMLINK"
+const (
+	// ServiceEnvPrefix 用于 steam_link 私有配置。
+	ServiceEnvPrefix = "STEAMLINK"
+	// SharedEnvPrefix 用于跨服务共享的 MySQL / Redis 连接配置。
+	SharedEnvPrefix = "PLAYPILOT"
+)
 
 // 三套环境。取值必须白名单校验：写错一个字母时，viper 只会静默地
 // 跳过不存在的 config.{env}.yaml，服务带着一份基础配置照常启动 ——
@@ -71,9 +75,14 @@ func (c MySQLConfig) DSN() string {
 }
 
 type RedisConfig struct {
-	Addr     string `mapstructure:"addr"`
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
 	Password string `mapstructure:"password"`
 	DB       int    `mapstructure:"db"`
+}
+
+func (c RedisConfig) Address() string {
+	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
 type SteamConfig struct {
@@ -97,24 +106,53 @@ type LogConfig struct {
 	Format string `mapstructure:"format"`
 }
 
-// secretBindings 是必须由环境变量提供的敏感项。
+// envBindings 明确区分跨服务基础设施变量与 steam_link 私有变量。
+// 未列出的服务配置仍使用 STEAMLINK_<KEY> 的自动映射。
+var envBindings = map[string]string{
+	"mysql.host":        SharedEnvPrefix + "_MYSQL_HOST",
+	"mysql.port":        SharedEnvPrefix + "_MYSQL_PORT",
+	"mysql.user":        SharedEnvPrefix + "_MYSQL_USERNAME",
+	"mysql.password":    SharedEnvPrefix + "_MYSQL_PASSWORD",
+	"mysql.database":    ServiceEnvPrefix + "_MYSQL_DATABASE",
+	"redis.host":        SharedEnvPrefix + "_REDIS_HOST",
+	"redis.port":        SharedEnvPrefix + "_REDIS_PORT",
+	"redis.password":    SharedEnvPrefix + "_REDIS_PASSWORD",
+	"redis.db":          ServiceEnvPrefix + "_REDIS_DATABASE",
+	"steam.api_key":     ServiceEnvPrefix + "_STEAM_API_KEY",
+	"auth.state_secret": ServiceEnvPrefix + "_AUTH_STATE_SECRET",
+	"http.base_url":     ServiceEnvPrefix + "_HTTP_BASE_URL",
+}
+
+func envNameForKey(key string) string {
+	if name, ok := envBindings[key]; ok {
+		return name
+	}
+	return ServiceEnvPrefix + "_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+}
+
+// secretBindings 是启动时必须存在的敏感项。
 // 显式 BindEnv 而非只依赖 AutomaticEnv：后者只在 Get 时生效，
 // Unmarshal 走 AllKeys，一旦某个 key 不在 YAML 中就会被静默跳过。
 var secretBindings = map[string]string{
-	"steam.api_key":     EnvPrefix + "_STEAM_API_KEY",
-	"mysql.password":    EnvPrefix + "_MYSQL_PASSWORD",
-	"auth.state_secret": EnvPrefix + "_AUTH_STATE_SECRET",
+	"steam.api_key":     ServiceEnvPrefix + "_STEAM_API_KEY",
+	"mysql.password":    SharedEnvPrefix + "_MYSQL_PASSWORD",
+	"auth.state_secret": ServiceEnvPrefix + "_AUTH_STATE_SECRET",
 }
 
 // Load 按四层优先级加载配置：
 //
 //	configs/config.yaml        基础值
 //	configs/config.{env}.yaml  环境覆盖
-//	configs/{env}.env          本机注入的地址与密钥（不进仓库）
+//	共享目录/{env}.env         本机注入的地址与密钥（不进仓库）
 //	真实环境变量                最高优先级
 //
 // env 取自 APP_ENV，缺省为 local。
 func Load(dir string) (Config, error) {
+	return LoadWithEnvDir(dir, dir)
+}
+
+// LoadWithEnvDir 分开读取服务 YAML 与跨服务共享 env 文件。
+func LoadWithEnvDir(configDir, envDir string) (Config, error) {
 	env := os.Getenv("APP_ENV")
 	if env == "" {
 		env = EnvLocal
@@ -124,14 +162,14 @@ func Load(dir string) (Config, error) {
 			ErrUnknownEnv, env, EnvLocal, EnvTest, EnvProd)
 	}
 
-	fileVars, err := readEnvFile(filepath.Join(dir, env+".env"))
+	fileVars, err := readEnvFile(filepath.Join(envDir, env+".env"))
 	if err != nil {
 		return Config{}, err
 	}
 
 	v := viper.New()
 	v.SetConfigType("yaml")
-	v.AddConfigPath(dir)
+	v.AddConfigPath(configDir)
 
 	v.SetConfigName("config")
 	if err := v.ReadInConfig(); err != nil {
@@ -147,10 +185,10 @@ func Load(dir string) (Config, error) {
 		// 环境专属文件可以不存在，此时仅使用基础配置
 	}
 
-	v.SetEnvPrefix(EnvPrefix)
+	v.SetEnvPrefix(ServiceEnvPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
-	for key, envName := range secretBindings {
+	for key, envName := range envBindings {
 		if err := v.BindEnv(key, envName); err != nil {
 			return Config{}, err
 		}
@@ -192,7 +230,7 @@ func (c Config) validate() error {
 
 	if c.App.Env == EnvProd {
 		if c.HTTP.BaseURL == "" {
-			return fmt.Errorf("config: prod 环境必须设置 %s_HTTP_BASE_URL", EnvPrefix)
+			return fmt.Errorf("config: prod 环境必须设置 %s_HTTP_BASE_URL", ServiceEnvPrefix)
 		}
 		if !strings.HasPrefix(c.HTTP.BaseURL, "https://") {
 			return fmt.Errorf("config: prod 环境的 http.base_url 必须是 https，当前为 %q", c.HTTP.BaseURL)

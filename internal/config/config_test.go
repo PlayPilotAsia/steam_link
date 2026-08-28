@@ -15,7 +15,7 @@ const testConfigDir = "../../configs"
 func setSecrets(t *testing.T) {
 	t.Helper()
 	t.Setenv("STEAMLINK_STEAM_API_KEY", "TESTKEY")
-	t.Setenv("STEAMLINK_MYSQL_PASSWORD", "testpass")
+	t.Setenv("PLAYPILOT_MYSQL_PASSWORD", "testpass")
 	t.Setenv("STEAMLINK_AUTH_STATE_SECRET", "test-state-secret")
 }
 
@@ -67,7 +67,7 @@ func TestLoad_SecretsComeFromEnvNotYAML(t *testing.T) {
 func TestLoad_MissingSecretFails(t *testing.T) {
 	t.Setenv("APP_ENV", EnvLocal)
 	t.Setenv("STEAMLINK_STEAM_API_KEY", "")
-	t.Setenv("STEAMLINK_MYSQL_PASSWORD", "testpass")
+	t.Setenv("PLAYPILOT_MYSQL_PASSWORD", "testpass")
 	t.Setenv("STEAMLINK_AUTH_STATE_SECRET", "test-state-secret")
 
 	_, err := Load(testConfigDir)
@@ -144,7 +144,7 @@ func TestMySQLDSN_ForcesParseTimeAndUTC(t *testing.T) {
 	require.Contains(t, dsn, "charset=utf8mb4")
 }
 
-// ---------- configs/{env}.env ----------
+// ---------- 共享配置目录/{env}.env ----------
 
 // clearEnv 清掉指定的环境变量并在用例结束时还原。
 //
@@ -165,48 +165,46 @@ func clearSteamlinkEnv(t *testing.T) {
 	t.Helper()
 	clearEnv(t,
 		"STEAMLINK_STEAM_API_KEY",
-		"STEAMLINK_MYSQL_HOST", "STEAMLINK_MYSQL_PORT", "STEAMLINK_MYSQL_USER",
-		"STEAMLINK_MYSQL_PASSWORD", "STEAMLINK_MYSQL_DATABASE",
-		"STEAMLINK_REDIS_ADDR", "STEAMLINK_REDIS_PASSWORD",
+		"PLAYPILOT_MYSQL_HOST", "PLAYPILOT_MYSQL_PORT", "PLAYPILOT_MYSQL_USERNAME",
+		"PLAYPILOT_MYSQL_PASSWORD", "STEAMLINK_MYSQL_DATABASE",
+		"PLAYPILOT_REDIS_HOST", "PLAYPILOT_REDIS_PORT", "PLAYPILOT_REDIS_PASSWORD",
+		"STEAMLINK_REDIS_DATABASE",
 		"STEAMLINK_AUTH_STATE_SECRET", "STEAMLINK_HTTP_BASE_URL",
 	)
 }
 
-// 用临时目录构造一套完整配置，避免依赖仓库里那份不进版本控制的 .env。
+// 用临时目录构造共享 env，避免依赖工作空间里不进版本控制的真实文件。
 func envFileDir(t *testing.T, envName, content string) string {
 	t.Helper()
 	clearSteamlinkEnv(t)
 	dir := t.TempDir()
-
-	base, err := os.ReadFile(filepath.Join(testConfigDir, "config.yaml"))
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), base, 0o600))
 
 	require.NoError(t, os.WriteFile(
 		filepath.Join(dir, envName+".env"), []byte(content), 0o600))
 	return dir
 }
 
-// 地址与密钥都从 configs/{env}.env 读入，仓库里不必有任何真实值。
+// 地址与密钥都从共享 {env}.env 读入，仓库里不必有任何真实值。
 func TestLoad_ReadsEnvFile(t *testing.T) {
 	t.Setenv("APP_ENV", EnvTest)
 	dir := envFileDir(t, EnvTest, `
 # 阿里云实例（公网）
-STEAMLINK_MYSQL_HOST=rm-example.mysql.rds.aliyuncs.com
-STEAMLINK_MYSQL_PORT=3307
-STEAMLINK_MYSQL_PASSWORD="p@ss word#1"
-export STEAMLINK_REDIS_ADDR=r-example.redis.rds.aliyuncs.com:6379
+PLAYPILOT_MYSQL_HOST=rm-example.mysql.rds.aliyuncs.com
+PLAYPILOT_MYSQL_PORT=3307
+PLAYPILOT_MYSQL_PASSWORD="p@ss word#1"
+export PLAYPILOT_REDIS_HOST=r-example.redis.rds.aliyuncs.com
+PLAYPILOT_REDIS_PORT=6380
 STEAMLINK_STEAM_API_KEY=KEYFROMFILE
 STEAMLINK_AUTH_STATE_SECRET=secret-from-file
 `)
 
-	cfg, err := Load(dir)
+	cfg, err := LoadWithEnvDir(testConfigDir, dir)
 	require.NoError(t, err)
 
 	require.Equal(t, "rm-example.mysql.rds.aliyuncs.com", cfg.MySQL.Host)
 	require.Equal(t, 3307, cfg.MySQL.Port)
 	require.Equal(t, "p@ss word#1", cfg.MySQL.Password, "引号内的空格与 # 必须原样保留")
-	require.Equal(t, "r-example.redis.rds.aliyuncs.com:6379", cfg.Redis.Addr)
+	require.Equal(t, "r-example.redis.rds.aliyuncs.com:6380", cfg.Redis.Address())
 	require.Equal(t, "KEYFROMFILE", cfg.Steam.APIKey)
 }
 
@@ -215,15 +213,15 @@ STEAMLINK_AUTH_STATE_SECRET=secret-from-file
 func TestLoad_RealEnvBeatsEnvFile(t *testing.T) {
 	t.Setenv("APP_ENV", EnvTest)
 	dir := envFileDir(t, EnvTest, `
-STEAMLINK_MYSQL_HOST=from-file
-STEAMLINK_MYSQL_PASSWORD=pw
+PLAYPILOT_MYSQL_HOST=from-file
+PLAYPILOT_MYSQL_PASSWORD=pw
 STEAMLINK_STEAM_API_KEY=k
 STEAMLINK_AUTH_STATE_SECRET=s
 `)
 	// 在 envFileDir 清空环境之后再设，模拟部署时的容器变量
-	t.Setenv("STEAMLINK_MYSQL_HOST", "from-real-env")
+	t.Setenv("PLAYPILOT_MYSQL_HOST", "from-real-env")
 
-	cfg, err := Load(dir)
+	cfg, err := LoadWithEnvDir(testConfigDir, dir)
 	require.NoError(t, err)
 	require.Equal(t, "from-real-env", cfg.MySQL.Host)
 }
@@ -234,11 +232,7 @@ func TestLoad_MissingEnvFileIsFine(t *testing.T) {
 	setSecrets(t)
 
 	dir := t.TempDir()
-	base, err := os.ReadFile(filepath.Join(testConfigDir, "config.yaml"))
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), base, 0o600))
-
-	_, err = Load(dir)
+	_, err := LoadWithEnvDir(testConfigDir, dir)
 	require.NoError(t, err)
 }
 
@@ -246,9 +240,9 @@ func TestLoad_MissingEnvFileIsFine(t *testing.T) {
 // 排查起来比启动失败痛苦得多。
 func TestLoad_MalformedEnvFileFails(t *testing.T) {
 	t.Setenv("APP_ENV", EnvLocal)
-	dir := envFileDir(t, EnvLocal, "STEAMLINK_MYSQL_PASSWORD=pw\nJUST_A_KEY\n")
+	dir := envFileDir(t, EnvLocal, "PLAYPILOT_MYSQL_PASSWORD=pw\nJUST_A_KEY\n")
 
-	_, err := Load(dir)
+	_, err := LoadWithEnvDir(testConfigDir, dir)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "第 2 行")
 }

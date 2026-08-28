@@ -21,8 +21,16 @@ func configDir() string {
 	return "configs"
 }
 
+// envDir 指向工作空间共享的敏感配置目录；容器或从其他目录启动时应显式设置。
+func envDir() string {
+	if v := os.Getenv("PLAYPILOT_CONFIG_DIR"); v != "" {
+		return v
+	}
+	return "../../deploy/demo/env"
+}
+
 func main() {
-	cfg, err := config.Load(configDir())
+	cfg, err := config.LoadWithEnvDir(configDir(), envDir())
 	if err != nil {
 		// 此刻 Logger 尚未构造，配置错误用 stderr 直出并退出。
 		// 这是全项目唯一允许绕过 slog 的地方。
@@ -40,7 +48,7 @@ func main() {
 		lg.Error("MySQL 连接失败", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
-	rdb, err := store.NewRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	rdb, err := store.NewRedis(cfg.Redis.Address(), cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		lg.Error("Redis 连接失败", slog.String("err", err.Error()))
 		os.Exit(1)

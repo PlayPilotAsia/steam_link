@@ -58,7 +58,7 @@ L0 的批量能力是成本支点：1000 个用户全量探测一轮仅需 10 �
 cmd/
   api/            Gin HTTP 服务：OpenID 登录、数据查询接口
   worker/         采集进程，可多实例水平扩展
-configs/          分环境 YAML + 各环境的 .env（后者不进仓库）
+configs/          服务自己的非敏感分环境 YAML
 scripts/db/       初始化 DDL 与增量迁移脚本
 scripts/dev/      本地依赖启动与测试脚本
 internal/
@@ -83,7 +83,7 @@ internal/
 | `test` | 本机 | 阿里云实例（公网 IP） |
 | `prod` | 阿里云 | 阿里云实例（内网 IP） |
 
-`configs/` 下的文件分两类：
+`configs/` 保存服务自己的非敏感 YAML；工作空间统一保存共享 env：
 
 ```
 configs/
@@ -91,13 +91,15 @@ configs/
   config.local.yaml     ┐
   config.test.yaml      ├ 各环境的非敏感覆盖项（会提交）
   config.prod.yaml      ┘
-  env.example           .env 模板（会提交）
+
+../../deploy/demo/env/
   local.env             ┐
-  test.env              ├ 实例地址与密钥（.gitignore 排除，不进仓库）
+  test.env              ├ 跨服务实例地址与密钥（根仓库忽略）
   prod.env              ┘
+  *.env.example         无敏感值模板（会提交）
 ```
 
-优先级从低到高：`config.yaml` → `config.{env}.yaml` → `configs/{env}.env` → 真实环境变量。
+优先级从低到高：`config.yaml` → `config.{env}.yaml` → 共享 `{env}.env` → 真实环境变量。
 最后一层意味着部署时用容器环境变量可覆盖 `.env` 里的任意一项，无需先删掉文件。
 
 实例地址与密钥全部走 `.env`，YAML 中一律留空：
@@ -105,8 +107,10 @@ configs/
 | 配置键 | 环境变量 |
 |---|---|
 | `steam.api_key` | `STEAMLINK_STEAM_API_KEY` |
-| `mysql.host` / `port` / `user` / `password` | `STEAMLINK_MYSQL_HOST` / `_PORT` / `_USER` / `_PASSWORD` |
-| `redis.addr` / `password` | `STEAMLINK_REDIS_ADDR` / `STEAMLINK_REDIS_PASSWORD` |
+| `mysql.host` / `port` / `user` / `password` | `PLAYPILOT_MYSQL_HOST` / `_PORT` / `_USERNAME` / `_PASSWORD` |
+| `mysql.database` | `STEAMLINK_MYSQL_DATABASE` |
+| `redis.host` / `port` / `password` | `PLAYPILOT_REDIS_HOST` / `_PORT` / `_PASSWORD` |
+| `redis.db` | `STEAMLINK_REDIS_DATABASE` |
 | `auth.state_secret` | `STEAMLINK_AUTH_STATE_SECRET` |
 | `http.base_url`（仅 prod 必填，且必须 https） | `STEAMLINK_HTTP_BASE_URL` |
 
@@ -115,7 +119,8 @@ configs/
 新环境从模板起步：
 
 ```bash
-cp configs/env.example configs/test.env   # 然后填入实例地址与密钥
+cp ../../deploy/demo/env/test.env.example ../../deploy/demo/env/test.env
+chmod 600 ../../deploy/demo/env/test.env
 ```
 
 > 连阿里云（`test`）时记得把本机出口 IP 加进 RDS / Redis 的白名单，否则连接会超时。

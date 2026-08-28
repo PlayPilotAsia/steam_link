@@ -1,7 +1,7 @@
 # 基础配置，所有环境共享。
 #
-# 敏感项与环境相关的连接地址一律留空，由 configs/{env}.env 注入
-# （见 configs/env.example）。本文件会提交到仓库，任何写在这里的
+# 敏感项与环境相关的连接地址一律留空，由工作空间
+# deploy/demo/env/{env}.env 注入。本文件会提交到仓库，任何写在这里的
 # 密钥都等同于公开。
 #
 # 三套环境：
@@ -24,15 +24,16 @@ http:
   base_url: "http://localhost:9994"
 
 mysql:
-  host: "127.0.0.1"     # ← STEAMLINK_MYSQL_HOST（test/prod 必填）
-  port: 3306            # ← STEAMLINK_MYSQL_PORT
-  user: "root"          # ← STEAMLINK_MYSQL_USER
-  password: ""          # ← STEAMLINK_MYSQL_PASSWORD
+  host: "127.0.0.1"     # ← PLAYPILOT_MYSQL_HOST（test/prod 必填）
+  port: 3306            # ← PLAYPILOT_MYSQL_PORT
+  user: "root"          # ← PLAYPILOT_MYSQL_USERNAME
+  password: ""          # ← PLAYPILOT_MYSQL_PASSWORD
   database: "steamlink" # ← STEAMLINK_MYSQL_DATABASE
 
 redis:
-  addr: "127.0.0.1:6379" # ← STEAMLINK_REDIS_ADDR（test/prod 必填）
-  password: ""           # ← STEAMLINK_REDIS_PASSWORD
+  host: "127.0.0.1"      # ← PLAYPILOT_REDIS_HOST（test/prod 必填）
+  port: 6379             # ← PLAYPILOT_REDIS_PORT
+  password: ""           # ← PLAYPILOT_REDIS_PASSWORD
   db: 0
 
 steam:

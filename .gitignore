@@ -28,8 +28,7 @@ go.work.sum
 
 # env file
 .env
-# 分环境的密钥文件：configs/{local,test,prod}.env
-# 模板 configs/env.example 不带 .env 后缀，照常提交
+# 防御性忽略旧位置；正式共享文件位于工作空间 deploy/demo/env/。
 configs/*.env
 
 # Editor/IDE

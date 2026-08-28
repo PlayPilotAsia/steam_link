@@ -23,8 +23,15 @@ func configDir() string {
 	return "configs"
 }
 
+func envDir() string {
+	if v := os.Getenv("PLAYPILOT_CONFIG_DIR"); v != "" {
+		return v
+	}
+	return "../../deploy/demo/env"
+}
+
 func main() {
-	cfg, err := config.Load(configDir())
+	cfg, err := config.LoadWithEnvDir(configDir(), envDir())
 	if err != nil {
 		os.Stderr.WriteString("配置加载失败: " + err.Error() + "\n")
 		os.Exit(1)
@@ -40,7 +47,7 @@ func main() {
 		lg.Error("MySQL 连接失败", slog.String("err", err.Error()))
 		os.Exit(1)
 	}
-	rdb, err := store.NewRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	rdb, err := store.NewRedis(cfg.Redis.Address(), cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		lg.Error("Redis 连接失败", slog.String("err", err.Error()))
 		os.Exit(1)
