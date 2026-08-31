@@ -15,13 +15,13 @@ http:
   addr: ":9994"
   # 站点根地址，派生出 OpenID 的两个参数：
   #   openid.realm     = {base_url}
-  #   openid.return_to = {base_url}/auth/steam/callback?state=...
+  #   openid.return_to = {base_url}/noauth/steam/callback?state=...
   # Steam 会校验 return_to 落在 realm 之下（同 scheme/host/port）。
   #
   # 它需要「用户的浏览器」能访问，而非「Steam 的服务器」能访问 ——
   # Steam 是用 302 把用户浏览器重定向回来的，不存在服务端回调。
   # 因此本地开发用 localhost 完全可行，无需内网穿透。
-  base_url: "http://localhost:9994"
+  base_url: "http://localhost:9980"
 
 mysql:
   host: "127.0.0.1"     # ← PLAYPILOT_MYSQL_HOST（test/prod 必填）
@@ -45,7 +45,6 @@ steam:
 
 auth:
   state_secret: ""      # ← STEAMLINK_AUTH_STATE_SECRET
-  session_ttl: 24h
 
 worker:
   concurrency: 4

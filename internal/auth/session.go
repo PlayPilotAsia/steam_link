@@ -1,19 +1,14 @@
 package auth
 
 import (
-	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // ErrStateInvalid 表示 CSRF state 签名不匹配或已过期。
@@ -60,39 +55,4 @@ func sign(secret []byte, payload string) string {
 	m := hmac.New(sha256.New, secret)
 	m.Write([]byte(payload))
 	return hex.EncodeToString(m.Sum(nil))
-}
-
-// ---------- 登录会话 ----------
-
-type SessionStore struct {
-	rdb *redis.Client
-	ttl time.Duration
-}
-
-func NewSessionStore(rdb *redis.Client, ttl time.Duration) *SessionStore {
-	return &SessionStore{rdb: rdb, ttl: ttl}
-}
-
-func (s *SessionStore) key(token string) string { return "session:" + token }
-
-func (s *SessionStore) Issue(ctx context.Context, userID uint64) (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	token := base64.RawURLEncoding.EncodeToString(buf)
-
-	if err := s.rdb.Set(ctx, s.key(token),
-		strconv.FormatUint(userID, 10), s.ttl).Err(); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func (s *SessionStore) Resolve(ctx context.Context, token string) (uint64, error) {
-	v, err := s.rdb.Get(ctx, s.key(token)).Result()
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseUint(v, 10, 64)
 }

@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,44 +16,26 @@ import (
 	"github.com/PlayPilotAsia/steam_link/internal/store"
 )
 
-// SessionCookieName 是承载本站登录态的 Cookie 名。
-//
-// 必须用 Cookie 而非 Authorization 头：OpenID 流程包含两次浏览器顶层导航
-// （本站 → Steam、Steam → 本站），顶层导航无法携带自定义请求头，
-// 用 fetch 又会撞上跨域重定向。Cookie 是唯一能贯穿整个流程的载体。
-const SessionCookieName = "steamlink_session"
+const userIDHeader = "X-User-Id"
 
-// setSessionCookie 写入登录态 Cookie。
-//
-// SameSite 必须是 Lax 而非 Strict：Steam 回跳是一次跨站顶层 GET 导航，
-// Strict 会拒绝携带 Cookie，导致回调时读不到用户身份、绑定必然失败。
-// Lax 恰好允许跨站顶层 GET 携带 Cookie，同时仍能挡住跨站 POST 的 CSRF。
-func (d Deps) setSessionCookie(c *gin.Context, token string, ttl time.Duration) {
-	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     SessionCookieName,
-		Value:    token,
-		Path:     "/",
-		MaxAge:   int(ttl.Seconds()),
-		HttpOnly: true,
-		Secure:   strings.HasPrefix(d.BaseURL, "https://"),
-		SameSite: http.SameSiteLaxMode,
-	})
-}
-
-// currentUserID 从 Cookie 解析本站用户。
-//
-// 本项目假设已有账号体系：该体系在用户登录时调用 auth.SessionStore.Issue
-// 签发 token 并通过 setSessionCookie 下发，本项目只负责消费。
-func (d Deps) currentUserID(c *gin.Context) (uint64, bool) {
-	tok, err := c.Cookie(SessionCookieName)
-	if err != nil || tok == "" {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "请先登录"})
+// trustedUserID 只读取 Gateway 注入的可信身份头。客户端原始同名头必须由
+// Gateway 无条件剥离；steam_link 自身不再解析 Cookie 或访问登录态 Redis。
+func trustedUserID(c *gin.Context) (uint64, bool) {
+	raw := c.GetHeader(userIDHeader)
+	if raw == "" {
 		return 0, false
 	}
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || id == 0 {
+		return 0, false
+	}
+	return id, true
+}
 
-	id, err := d.Auth.Resolve(c.Request.Context(), tok)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "登录已过期，请重新登录"})
+func (d Deps) currentUserID(c *gin.Context) (uint64, bool) {
+	id, ok := trustedUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "请先登录"})
 		return 0, false
 	}
 	return id, true
@@ -64,19 +46,14 @@ func (d Deps) currentUserID(c *gin.Context) (uint64, bool) {
 // 这是一个浏览器顶层导航入口（前端用 window.location 跳转过来），
 // 因此失败时也必须重定向而非返回 JSON —— 用户看到的是页面，不是接口响应。
 func (d Deps) handleLogin(c *gin.Context) {
-	tok, err := c.Cookie(SessionCookieName)
-	if err != nil || tok == "" {
-		d.redirectResult(c, "unauthorized")
-		return
-	}
-	userID, err := d.Auth.Resolve(c.Request.Context(), tok)
-	if err != nil {
+	userID, ok := trustedUserID(c)
+	if !ok {
 		d.redirectResult(c, "unauthorized")
 		return
 	}
 
 	state := auth.SignState(d.StateSecret, userID, time.Now().UTC())
-	returnTo := d.BaseURL + "/auth/steam/callback?state=" + url.QueryEscape(state)
+	returnTo := d.BaseURL + "/noauth/steam/callback?state=" + url.QueryEscape(state)
 
 	c.Redirect(http.StatusFound, auth.BuildRedirectURL(d.BaseURL, returnTo))
 }
@@ -140,27 +117,6 @@ func (d Deps) handleRecheck(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, d.probeAndPersist(c, link.SteamID))
-}
-
-// handleDevLogin 仅在 dev 环境注册，直接为指定 user_id 签发登录态。
-// 生产环境由既有账号体系承担同样的职责（调用 Issue + setSessionCookie）。
-func (d Deps) handleDevLogin(c *gin.Context) {
-	var req struct {
-		UserID uint64 `json:"user_id"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.UserID == 0 {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Code: "bad_request", Message: "缺少 user_id"})
-		return
-	}
-
-	tok, err := d.Auth.Issue(c.Request.Context(), req.UserID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "签发失败"})
-		return
-	}
-
-	d.setSessionCookie(c, tok, d.SessionTTL)
-	c.JSON(http.StatusOK, gin.H{"user_id": req.UserID})
 }
 
 func (d Deps) handleUnlink(c *gin.Context) {

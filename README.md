@@ -68,7 +68,7 @@ internal/
   domain/         会话状态机与业务规则（纯函数，无 IO）
   collector/      L0–L3 各层 job 处理器
   task/           本地事务表：入队、扫描、租约、退避重试
-  auth/           OpenID 2.0 验证 + Redis session
+  auth/           OpenID 2.0 验证 + 签名 state
   store/          GORM repository
   api/            Gin handler 与 DTO
 ```
@@ -151,9 +151,31 @@ TEST_MYSQL_DSN='root:pw@tcp(127.0.0.1:3306)/mydb?parseTime=true&loc=UTC&charset=
 
 `parseTime=true` 与 `loc=UTC` 是必须的，否则 `DATETIME` 扫描进 `time.Time` 会失败或带错时区。
 
-Redis 侧已按 DB 序号隔开（`internal/auth` 用 14、`internal/steam` 用 15），无需额外配置。
+Redis 集成测试使用隔离的 DB 15（`internal/steam`）；登录会话由 user_center 签发并由
+Gateway 校验，steam_link 不再读写登录态 Redis。
 
 要求 **Go 1.24+**、**MySQL 8.0.1+**（低于此版本 `SELECT ... FOR UPDATE SKIP LOCKED` 不可用，整个任务表方案失效）。
+
+## API 与身份信任边界
+
+公网请求必须先经过 Gateway。免登录入口位于 `/noauth/steam/**`，业务接口位于
+`/api/steam/**`；steam_link 不解析 Cookie 或 Bearer token，只读取 Gateway
+注入的 `X-User-Id`。
+
+> **安全前提：禁止把 steam_link 端口直接暴露到公网。** 客户端可以任意伪造
+> `X-User-Id`，只有 Gateway 会先删除伪造值再注入真实身份。Docker 发布端口时
+> 必须绑定宿主机回环地址（例如 `127.0.0.1:9994:9994`），并确保只有 Gateway
+> 所在的受信网络能够直连该服务。绕过 Gateway 直连即等同于绕过鉴权。
+
+当前路由：
+
+- `GET /noauth/steam/login`
+- `GET /noauth/steam/callback`
+- `GET /api/steam/library`
+- `DELETE /api/steam/link`
+- `POST /api/steam/link/recheck`
+- `GET /api/steam/games/:appid/achievements`
+- `GET /api/steam/achievements/recent`
 
 ## 已知约束
 

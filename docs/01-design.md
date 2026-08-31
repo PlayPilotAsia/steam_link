@@ -156,7 +156,7 @@ internal/
   domain/             会话状态机与业务规则（纯函数，无 IO）
   collector/          L0–L3 各层 job 处理器
   task/               本地事务表：入队、扫描、租约、退避重试
-  auth/               OpenID 2.0 验证 + Redis session
+  auth/               OpenID 2.0 验证 + 签名 state
   store/              GORM repository
   api/                Gin handler 与 DTO
 ```
@@ -199,13 +199,12 @@ func Advance(prev State, sample Probe, now time.Time) (State, []Event)
 
 这条线必须划死：会话状态（`probe_state`）绝不能放 Redis —— 它一旦丢失会直接导致错误的游戏会话记录被写入历史事件流，而事件流是永久保留的。
 
-Redis 承担四项职责，全部可在丢失后重建：
+Redis 承担三项职责，全部可在丢失后重建：
 
 | 用途 | 数据结构 | 说明 |
 |---|---|---|
 | 全局限流 | Lua 令牌桶 | 多 worker 实例共享同一个 Steam 调用速率闸门 |
 | 每日配额 | `steam:quota:{date}` 计数器 + EXPIRE | 逼近上限时自动降级 |
-| 登录会话 | session token → user_id | OpenID 回调后签发 |
 | 成就 Schema 缓存 | `steam:schema:{appid}` | 成就定义几乎不变，避免反复查库 |
 
 ### 4.6 配置管理
@@ -636,10 +635,14 @@ Steam 的 endpoint：`https://steamcommunity.com/openid/login`
 
 **第一步 · 重定向**
 
+浏览器先访问 Gateway 的 `/noauth/steam/login`。Gateway 若能解析登录态，就把
+可信 `X-User-Id` 注入 steam_link；steam_link 将该用户 ID 写入签名 state。
+steam_link 不再解析 Cookie，也不再持有登录 SessionStore。
+
 ```
 openid.ns          = http://specs.openid.net/auth/2.0
 openid.mode        = checkid_setup
-openid.return_to   = {base_url}/auth/steam/callback?state=<signed>
+openid.return_to   = {base_url}/noauth/steam/callback?state=<signed>
 openid.realm       = {base_url}
 openid.identity    = http://specs.openid.net/auth/2.0/identifier_select
 openid.claimed_id  = http://specs.openid.net/auth/2.0/identifier_select

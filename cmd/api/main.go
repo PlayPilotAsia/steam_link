@@ -65,14 +65,9 @@ func main() {
 		Tasks:       task.NewMySQLQueue(db),
 		Steam:       sc,
 		Verifier:    auth.NewVerifier(),
-		Auth:        auth.NewSessionStore(rdb, cfg.Auth.SessionTTL),
 		BaseURL:     cfg.HTTP.BaseURL,
 		StateSecret: []byte(cfg.Auth.StateSecret),
-		SessionTTL:  cfg.Auth.SessionTTL,
-		// 本地登录端点只在非生产环境开放：local 与 test 都是开发者自己
-		// 在本机运行，区别只是连哪套数据库。
-		DevMode: cfg.App.Env != config.EnvProd,
-		Logger:  lg,
+		Logger:      lg,
 	})
 
 	lg.Info("API 启动", slog.String("addr", cfg.HTTP.Addr),

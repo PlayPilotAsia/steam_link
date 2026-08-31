@@ -92,8 +92,7 @@ type SteamConfig struct {
 }
 
 type AuthConfig struct {
-	StateSecret string        `mapstructure:"state_secret"`
-	SessionTTL  time.Duration `mapstructure:"session_ttl"`
+	StateSecret string `mapstructure:"state_secret"`
 }
 
 type WorkerConfig struct {
