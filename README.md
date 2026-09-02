@@ -26,6 +26,25 @@ PlayPilot
 └── 社区
 ```
 
+## 域边界
+
+| 属于这里 | 不属于这里 |
+|---|---|
+| Steam 账号绑定与解绑（OpenID 2.0 验证归属） | **PlayPilot 账号本身、登录、密码** → `services/user_center` |
+| 从 Steam 采集游戏库、成就、游玩会话 | 校验登录态、注入 `X-User-Id` → `services/gateway` |
+| 采集调度、限流、退避重试、补偿 | 帖子、评论、资讯 → `services/content_center` |
+| 会话事件流与时长的**原始事实**（含精度标注） | 页面展示与图表 → `apps/playpilot-web` |
+| 与 Steam Web API 打交道的全部细节 | 基于画像的推荐算法与排序 —— **尚无归属**，实现时再定 |
+
+**本仓是「Steam 游戏画像」的数据底座，产出事实而非结论。**
+品类偏好、活跃时段这类派生解读由消费方计算 —— 本仓只保证原始数据准确、
+并诚实标注哪些是实测、哪些是推断补齐（`source=reconcile`）。
+
+**steam_link 完全不碰登录态。** 它不解析 Cookie 或 Bearer token、不读写会话 Redis，
+只读 Gateway 注入的 `X-User-Id`。绑定关系用 `userId` 引用 PlayPilot 用户，不复制用户档案字段。
+
+跨仓的接口与身份约定见 [`../../docs/conventions/api-contract.md`](../../docs/conventions/api-contract.md)。
+
 ## 技术栈
 
 | 层 | 选型 |
@@ -186,4 +205,6 @@ Gateway 校验，steam_link 不再读写登录态 Redis。
 ## 文档
 
 - [设计文档](docs/01-design.md) — 平台约束、数据模型、采集管线、可靠性设计
-- [实施文档](docs/02-implementation.md) — 分阶段落地细节（已实施完毕，冻结为历史留痕，不再随代码更新）
+- [逆向规格](../../docs/specs/spec-steamlink-overview.md) — 从代码反推的实现规格（工作空间文档）
+
+> 早期的 `docs/02-implementation.md`（分阶段落地细节）已在实施完成后删除，不再维护。
