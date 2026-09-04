@@ -18,9 +18,13 @@ if ! docker inspect "$MYSQL_CONTAINER" >/dev/null 2>&1; then
   MYSQL_ROOT_PASSWORD=root
 fi
 
+# --default-character-set=utf8mb4 不能省：mysql 客户端默认按 locale 推导字符集，
+# 而官方镜像里 LANG 是空的，会回落成 latin1，把 DDL 里的中文注释按 cp1252
+# 重新编码后写进元数据（表面现象是 SHOW CREATE TABLE 里的 COMMENT 变成乱码）。
 mysql_exec() {
   docker exec -i "$MYSQL_CONTAINER" \
-    mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$@" 2>&1 | grep -v '^mysql: \[Warning\]' || true
+    mysql --default-character-set=utf8mb4 -uroot -p"$MYSQL_ROOT_PASSWORD" "$@" \
+    2>&1 | grep -v '^mysql: \[Warning\]' || true
 }
 
 echo "==> 确保数据库 $MYSQL_DATABASE 存在"
