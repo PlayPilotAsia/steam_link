@@ -1,10 +1,11 @@
 package api
 
 import (
-	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/PlayPilotAsia/libra/errcode"
 )
 
 func (d Deps) handleLibrary(c *gin.Context) {
@@ -16,13 +17,13 @@ func (d Deps) handleLibrary(c *gin.Context) {
 	ctx := c.Request.Context()
 	link, err := d.Links.ByUserID(ctx, userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Code: "not_linked", Message: "尚未绑定 Steam 账号"})
+		fail(c, errcode.SteamLinkNotFound)
 		return
 	}
 
 	rows, err := d.Games.ListLibrary(ctx, link.SteamID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "查询失败"})
+		fail(c, errcode.SteamSystemError)
 		return
 	}
 
@@ -45,7 +46,7 @@ func (d Deps) handleLibrary(c *gin.Context) {
 	}
 
 	slug, hint := visibilityHint(link.VisibilityState)
-	c.JSON(http.StatusOK, gin.H{
+	succeed(c, gin.H{
 		"visibility": slug,
 		"hint":       hint,
 		"games":      items,

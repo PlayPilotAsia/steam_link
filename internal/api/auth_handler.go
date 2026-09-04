@@ -10,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/PlayPilotAsia/libra/errcode"
+
 	"github.com/PlayPilotAsia/steam_link/internal/auth"
 	"github.com/PlayPilotAsia/steam_link/internal/collector"
 	"github.com/PlayPilotAsia/steam_link/internal/logging"
@@ -35,7 +37,7 @@ func trustedUserID(c *gin.Context) (uint64, bool) {
 func (d Deps) currentUserID(c *gin.Context) (uint64, bool) {
 	id, ok := trustedUserID(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, ErrorResponse{Code: "unauthorized", Message: "请先登录"})
+		fail(c, errcode.UserAuthUnauthenticated)
 		return 0, false
 	}
 	return id, true
@@ -112,11 +114,11 @@ func (d Deps) handleRecheck(c *gin.Context) {
 
 	link, err := d.Links.ByUserID(c.Request.Context(), userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Code: "not_linked", Message: "尚未绑定 Steam 账号"})
+		fail(c, errcode.SteamLinkNotFound)
 		return
 	}
 
-	c.JSON(http.StatusOK, d.probeAndPersist(c, link.SteamID))
+	succeed(c, d.probeAndPersist(c, link.SteamID))
 }
 
 func (d Deps) handleUnlink(c *gin.Context) {
@@ -125,10 +127,10 @@ func (d Deps) handleUnlink(c *gin.Context) {
 		return
 	}
 	if err := d.Links.Unlink(c.Request.Context(), userID); err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Code: "not_linked", Message: "尚未绑定 Steam 账号"})
+		fail(c, errcode.SteamLinkNotFound)
 		return
 	}
-	c.Status(http.StatusNoContent)
+	succeed(c, nil)
 }
 
 // probeAndPersist 同步探测隐私并落库游戏库，让用户立刻看到结果，

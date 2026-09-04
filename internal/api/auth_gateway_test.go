@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -9,6 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+
+	"github.com/PlayPilotAsia/libra/errcode"
+	"github.com/PlayPilotAsia/libra/response"
 
 	"github.com/PlayPilotAsia/steam_link/internal/auth"
 )
@@ -58,6 +62,7 @@ func TestCurrentUserIDRejectsMissingOrInvalidHeader(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			context, _ := gin.CreateTestContext(recorder)
 			context.Request = httptest.NewRequest(http.MethodGet, "/api/steam/library", nil)
+			context.Request.Header.Set(requestIDHeader, "request-id")
 			if value != "" {
 				context.Request.Header.Set(userIDHeader, value)
 			}
@@ -66,8 +71,32 @@ func TestCurrentUserIDRejectsMissingOrInvalidHeader(t *testing.T) {
 
 			require.False(t, ok)
 			require.Equal(t, http.StatusUnauthorized, recorder.Code)
+
+			var body response.Response
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+			require.Equal(t, errcode.UserAuthUnauthenticated.Code(), body.Code)
+			require.Equal(t, errcode.UserAuthUnauthenticated.DefaultMessage(), body.Message)
+			require.Equal(t, "request-id", body.TraceID)
+			require.Equal(t, map[string]any{}, body.Data)
 		})
 	}
+}
+
+func TestUnifiedSuccessResponseCarriesTraceIDAndData(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/steam/library", nil)
+	context.Request.Header.Set(requestIDHeader, "request-id")
+
+	succeed(context, gin.H{"value": "result"})
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var body response.Response
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+	require.Equal(t, errcode.Success, body.Code)
+	require.Equal(t, "success", body.Message)
+	require.Equal(t, "request-id", body.TraceID)
+	require.Equal(t, map[string]any{"value": "result"}, body.Data)
 }
 
 func TestHandleLoginRedirectsWhenGatewayIdentityMissing(t *testing.T) {

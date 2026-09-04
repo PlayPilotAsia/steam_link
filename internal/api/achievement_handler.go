@@ -1,10 +1,11 @@
 package api
 
 import (
-	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/PlayPilotAsia/libra/errcode"
 )
 
 type AchievementItem struct {
@@ -27,7 +28,7 @@ func (d Deps) handleGameAchievements(c *gin.Context) {
 
 	appID64, err := strconv.ParseUint(c.Param("appid"), 10, 32)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, ErrorResponse{Code: "bad_appid", Message: "无效的 appid"})
+		fail(c, errcode.SteamAppIDInvalid)
 		return
 	}
 	appID := uint32(appID64)
@@ -35,19 +36,19 @@ func (d Deps) handleGameAchievements(c *gin.Context) {
 	ctx := c.Request.Context()
 	link, err := d.Links.ByUserID(ctx, userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Code: "not_linked", Message: "尚未绑定 Steam 账号"})
+		fail(c, errcode.SteamLinkNotFound)
 		return
 	}
 
 	defs, err := d.Games.ListAchievementDefs(ctx, appID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "查询失败"})
+		fail(c, errcode.SteamSystemError)
 		return
 	}
 
 	unlocks, err := d.Sessions.ListUnlocks(ctx, link.SteamID, appID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "查询失败"})
+		fail(c, errcode.SteamSystemError)
 		return
 	}
 
@@ -73,7 +74,7 @@ func (d Deps) handleGameAchievements(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	succeed(c, gin.H{
 		"appid":    appID,
 		"total":    len(defs),
 		"unlocked": len(unlocks),
@@ -96,15 +97,15 @@ func (d Deps) handleRecentAchievements(c *gin.Context) {
 	ctx := c.Request.Context()
 	link, err := d.Links.ByUserID(ctx, userID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, ErrorResponse{Code: "not_linked", Message: "尚未绑定 Steam 账号"})
+		fail(c, errcode.SteamLinkNotFound)
 		return
 	}
 
 	rows, err := d.Sessions.RecentUnlocks(ctx, link.SteamID, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{Code: "internal", Message: "查询失败"})
+		fail(c, errcode.SteamSystemError)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"items": rows})
+	succeed(c, gin.H{"items": rows})
 }

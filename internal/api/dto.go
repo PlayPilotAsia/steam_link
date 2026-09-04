@@ -20,11 +20,6 @@ type GameItem struct {
 	AchTotal           uint16 `json:"ach_total"`
 }
 
-type ErrorResponse struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
 // visibilityHint 给出可操作的修复指引，而不是笼统的「数据获取失败」。
 func visibilityHint(state int8) (slug, hint string) {
 	switch state {
